@@ -8,11 +8,13 @@
 #   CHROOT_DIR            where to build the test rootfs (default /tmp/glenv-chroot-test)
 #   GLENV_TEST_KEEP=1     keep the chroot after a successful run (for inspection)
 #   ALPINE_VER            minirootfs version (default 3.24.2)
+#   GLENV_TEST_PREFIX     install prefix inside chroot (default /srv/glenv-test)
 set -u
 
 ROOTFS="${CHROOT_DIR:-/tmp/glenv-chroot-test}"
 ALPINE_VER="${ALPINE_VER:-3.24.2}"
-ALPINE_REL="v3.24"
+ALPINE_REL="v$(printf '%s' "$ALPINE_VER" | awk -F. '{print $1 "." $2}')"
+TEST_PREFIX="${GLENV_TEST_PREFIX:-/srv/glenv-test}"
 URL="https://dl-cdn.alpinelinux.org/alpine/$ALPINE_REL/releases/x86_64/alpine-minirootfs-$ALPINE_VER-x86_64.tar.gz"
 TREE=$(cd "$(dirname "$0")/.." && pwd)
 TARBALL="${TMPDIR:-/tmp}/alpine-minirootfs-$ALPINE_VER-x86_64.tar.gz"
@@ -31,7 +33,9 @@ assert() {   # assert "description" <command...>
 if [ "$(id -u)" -ne 0 ]; then
     command -v sudo >/dev/null 2>&1 || { echo "need root (no sudo)"; exit 1; }
     sudo -n true 2>/dev/null || { echo "need root: run 'sudo -v' first (or passwordless sudo, as in CI)"; exit 1; }
-    exec sudo -n sh "$0" "$@"
+    exec sudo -n env CHROOT_DIR="$ROOTFS" ALPINE_VER="$ALPINE_VER" \
+        GLENV_TEST_PREFIX="$TEST_PREFIX" GLENV_TEST_KEEP="${GLENV_TEST_KEEP:-0}" \
+        sh "$0" "$@"
 fi
 
 # ---- cleanup: unmount everything under $ROOTFS on exit -------------------
@@ -56,9 +60,9 @@ fi
 
 # preserve the .deb cache across runs (first run downloads, later runs fast)
 SAVED=""
-if [ -d "$ROOTFS/opt/glibc-env/debs" ]; then
+if [ -d "$ROOTFS$TEST_PREFIX/debs" ]; then
     SAVED=$(mktemp -d)
-    cp -a "$ROOTFS/opt/glibc-env/debs/." "$SAVED/" 2>/dev/null || true
+    cp -a "$ROOTFS$TEST_PREFIX/debs/." "$SAVED/" 2>/dev/null || true
 fi
 
 log "building rootfs at $ROOTFS"
@@ -66,8 +70,8 @@ rm -rf "$ROOTFS"
 mkdir -p "$ROOTFS"
 tar -xzf "$TARBALL" -C "$ROOTFS" || { echo "cannot extract minirootfs"; exit 1; }
 if [ -n "$SAVED" ]; then
-    mkdir -p "$ROOTFS/opt/glibc-env/debs"
-    cp -a "$SAVED/." "$ROOTFS/opt/glibc-env/debs/" 2>/dev/null || true
+    mkdir -p "$ROOTFS$TEST_PREFIX/debs"
+    cp -a "$SAVED/." "$ROOTFS$TEST_PREFIX/debs/" 2>/dev/null || true
     rm -rf "$SAVED"
     log "reused cached .deb packages"
 fi
@@ -91,7 +95,7 @@ chmod 755 "$T/install.sh" "$T/bin/glenv"
 
 # ---- 3. install (line mode: 3=full preset, y=confirm) ---------------------
 log "install: full preset, line mode"
-printf '3\ny\n' | chroot "$ROOTFS" sh /root/glenv/install.sh \
+printf '3\ny\n' | chroot "$ROOTFS" env GLENV_PREFIX="$TEST_PREFIX" sh /root/glenv/install.sh \
     > "$LOGDIR/glenv-cleanroom-install.log" 2>&1
 _rc=$?
 INSTALL_LOG="$LOGDIR/glenv-cleanroom-install.log"
@@ -105,8 +109,11 @@ assert "ld.so.cache non-empty"            test -s "$ROOTFS/etc/ld.so.cache"
 assert "fstab has bind mounts"            grep -q " /usr/lib/x86_64-linux-gnu " "$ROOTFS/etc/fstab"
 assert "profile.d present"                test -f "$ROOTFS/etc/profile.d/glibc-env.sh"
 assert "Wayland filter preloaded"         grep -q "glenv-wayland-filter" "$ROOTFS/etc/ld.so.preload"
-assert "glenv binary present"             test -x "$ROOTFS/opt/glibc-env/bin/glenv"
-if chroot "$ROOTFS" /opt/glibc-env/sysroot/usr/bin/hello 2>/dev/null | grep -q "Hello, world!"; then
+assert "glenv binary present in custom prefix" test -x "$ROOTFS$TEST_PREFIX/bin/glenv"
+assert "custom prefix ownership marker"    grep -qx "glenv managed prefix" "$ROOTFS$TEST_PREFIX/.glenv-prefix"
+chroot "$ROOTFS" "$TEST_PREFIX/bin/glenv" doctor > "$LOGDIR/glenv-cleanroom-doctor.log" 2>&1
+assert "glenv detects custom prefix from executable" grep -q "sysroot: $TEST_PREFIX/sysroot" "$LOGDIR/glenv-cleanroom-doctor.log"
+if chroot "$ROOTFS" "$TEST_PREFIX/sysroot/usr/bin/hello" 2>/dev/null | grep -q "Hello, world!"; then
     pass "direct glibc exec (hello)"
 else
     fail "direct glibc exec (hello)"
@@ -114,14 +121,14 @@ fi
 
 # ---- 4. uninstall ---------------------------------------------------------
 log "uninstall (keep prefix)"
-printf 'y\n' | chroot "$ROOTFS" sh /root/glenv/install.sh --uninstall \
+printf 'y\n' | chroot "$ROOTFS" env GLENV_PREFIX="$TEST_PREFIX" sh /root/glenv/install.sh --uninstall \
     > "$LOGDIR/glenv-cleanroom-uninstall.log" 2>&1
 _rc=$?
 UNINST_LOG="$LOGDIR/glenv-cleanroom-uninstall.log"
 if [ "$_rc" -eq 0 ]; then pass "uninstall exit code 0"; else fail "uninstall exit code $_rc"; fi
 assert "uninstall log says finished"      grep -q "uninstall finished" "$UNINST_LOG"
 assert "uninstall log all checks green"   grep -qE "[0-9]/[0-9] checks passed" "$UNINST_LOG"
-assert "no glenv fstab lines"             sh -c "! grep -q '^$ROOTFS/opt/' $ROOTFS/etc/fstab"
+assert "no glenv fstab lines"             sh -c "! grep -q '^$TEST_PREFIX/' $ROOTFS/etc/fstab"
 assert "bind mounts are gone"             sh -c "! mount | grep -q ' on $ROOTFS/usr/lib/x86_64-linux-gnu type'"
 assert "ld.so.preload has no filter"      sh -c "! grep -q glenv-wayland-filter $ROOTFS/etc/ld.so.preload"
 assert "ld.so.conf.d entry removed"       test ! -e "$ROOTFS/etc/ld.so.conf.d/glibc-env.conf"
@@ -129,17 +136,17 @@ assert "ld.so.cache removed"              test ! -e "$ROOTFS/etc/ld.so.cache"
 assert "profile.d removed"                test ! -e "$ROOTFS/etc/profile.d/glibc-env.sh"
 assert "loader removed"                   test ! -e "$ROOTFS/lib/ld-linux-x86-64.so.2"
 assert "/lib64 symlink removed"           test ! -e "$ROOTFS/lib64/ld-linux-x86-64.so.2"
-assert "prefix kept (no --purge)"          test -d "$ROOTFS/opt/glibc-env"
+assert "custom prefix kept (no --purge)"   test -d "$ROOTFS$TEST_PREFIX"
 
 # ---- 5. purge -------------------------------------------------------------
 log "uninstall --purge (delete prefix)"
-printf 'y\n' | chroot "$ROOTFS" sh /root/glenv/install.sh --uninstall --purge \
+printf 'y\n' | chroot "$ROOTFS" env GLENV_PREFIX="$TEST_PREFIX" sh /root/glenv/install.sh --uninstall --purge \
     > "$LOGDIR/glenv-cleanroom-purge.log" 2>&1
 _rc=$?
 PURGE_LOG="$LOGDIR/glenv-cleanroom-purge.log"
 if [ "$_rc" -eq 0 ]; then pass "purge exit code 0"; else fail "purge exit code $_rc"; fi
 assert "purge log says finished"          grep -q "uninstall finished" "$PURGE_LOG"
-assert "prefix deleted"                   test ! -d "$ROOTFS/opt/glibc-env"
+assert "custom prefix deleted"             test ! -d "$ROOTFS$TEST_PREFIX"
 
 # ---- summary --------------------------------------------------------------
 echo

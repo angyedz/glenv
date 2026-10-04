@@ -1,10 +1,10 @@
-# glenv — glibc subsystem on musl (Alpine + OpenRC)
+# glenv — glibc subsystem on Alpine/musl
 
 [![ci](https://github.com/angyedz/glenv/actions/workflows/ci.yml/badge.svg)](https://github.com/angyedz/glenv/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
-[![alpine](https://img.shields.io/badge/Alpine-3.24-orange.svg)](https://alpinelinux.org/)
+[![Alpine](https://img.shields.io/badge/Alpine-3.x%20%7C%20x86__64-orange.svg)](https://alpinelinux.org/)
 
-Run any **glibc programs** on a musl system without chroot or containers:
+Run **glibc programs** on Alpine/musl x86_64 without chroot or containers:
 full Debian trixie userspace (glibc 2.41, GTK, sound, GL/EGL, TLS) + `glenv` router.
 
 ## Quick start
@@ -14,6 +14,12 @@ git clone https://github.com/angyedz/glenv.git
 cd glenv
 sh install.sh
 ```
+
+Supported target: Alpine Linux 3.20+ on x86_64 (musl); CI exercises Alpine
+3.20 through 3.24. OpenRC is the tested init system; on other init systems
+the installer writes fstab entries but you must arrange to mount them at
+boot. Other CPU architectures are not supported by this build (Debian amd64
+packages and x86_64 loader are used).
 
 One self-contained file (POSIX sh / BusyBox ash — no Python or Go required to
 install), a component menu, a plan screen before any `sudo`, and byte-accurate
@@ -77,6 +83,9 @@ the preload filter line, `profile.d`, the `glenv` symlink and empty mount-point
 dirs — then verifies every removal. `apk` packages are left alone (they are
 harmless). Without `--purge` your sysroot stays in place, so re-installing is
 fast; the summary prints the one-liner to restore the PATH symlink.
+For safety, `--purge` only deletes a prefix carrying the installer's
+`.glenv-prefix` ownership marker. Older prefixes without that marker are
+uninstalled normally but deliberately retained.
 
 ## What the subsystem touches on the musl system (entry points only)
 
@@ -182,8 +191,9 @@ Run once interactively, or export `SUDO_ASKPASS` — the installer saves a
 working askpass helper in `$HOME/.glenv/askpass.sh` on first authentication.
 
 **Can I move the prefix?**
-Yes: `GLENV_PREFIX=/somewhere sh install.sh` reinstalls integration to the new
-location (old mounts/lines are replaced).
+Yes: `GLENV_PREFIX=/somewhere sh install.sh` installs into a dedicated absolute
+path (letters, digits, `/`, `.`, `_`, `-` only). `glenv` locates its sysroot
+relative to its own binary.
 
 **How do I add extra Debian packages?**
 `tools/fetch-deps.py [--update] package...` pulls them into the sysroot,

@@ -18,11 +18,14 @@ jobs:
         run: sh tests/scan.sh
 
   menu:
-    # runs in a real Alpine container so the menu is exercised under BusyBox ash
-    # (the same shell the installer runs on user machines)
-    name: installer menu (pty, BusyBox ash)
+    # exercise the installer under Alpine's BusyBox ash across supported branches
+    name: installer menu (pty, Alpine ${{ matrix.alpine }})
     runs-on: ubuntu-latest
-    container: alpine:3.24
+    strategy:
+      fail-fast: false
+      matrix:
+        alpine: ['3.20', '3.21', '3.22', '3.23', '3.24']
+    container: alpine:${{ matrix.alpine }}
     steps:
       - name: bootstrap repository (JS actions are unavailable on musl)
         run: |

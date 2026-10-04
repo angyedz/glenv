@@ -2,8 +2,10 @@
 
 `install.sh` is a single self-contained POSIX sh script, compatible with
 BusyBox ash — installing needs no Python, Go or compiler on the target
-machine. Everything it will do is shown on the plan screen **before** the
-first `sudo`.
+machine. The supported target is Alpine 3.x / musl / x86_64; other
+architectures and non-Alpine hosts are rejected. OpenRC is tested; other init
+systems need an administrator-configured boot-time `mount -a`. Everything it
+will do is shown on the plan screen **before** the first `sudo`.
 
 ## Usage
 
@@ -33,8 +35,15 @@ sh install.sh --uninstall --purge   # ... and delete the prefix
 |---|---|---|
 | `GLENV_PREFIX` | `/opt/glibc-env` | install prefix (sysroot, debs, tools) |
 | `GLENV_MIRROR` | `https://deb.debian.org/debian` | Debian mirror (suite `trixie`, `amd64`) |
+| `GLENV_DIST` | `trixie` | Debian suite for the glibc userspace |
+| `GLENV_DEBIAN_ARCH` | `amd64` | Debian package architecture (this build supports `amd64` only) |
 | `GLENV_COMPONENTS` | — | same as `--components` (flag wins) |
 | `GLENV_TEST_SKIP_SYSTEM` | `0` | internal test hook: stop before system changes |
+| `GLENV_TEST_ALLOW_HOST` | `0` | internal test hook used only by the pty test; bypasses Alpine/musl/apk preflight checks |
+
+`GLENV_PREFIX` must be a dedicated absolute directory path using only letters,
+digits, `/`, `.`, `_` and `-`; system-root paths, `..` components and whitespace
+are rejected.
 
 ## Components (mutually exclusive groups)
 
@@ -78,6 +87,9 @@ group names (`core,gl,net`), or empty = full.
 The uninstall flow uses six stages of its own
 (`Preflight → Plan → Privileges → Remove → Verify → Done`) and does not
 touch the network at all.
+Purge is guarded by a `.glenv-prefix` ownership marker. Existing installations
+created by earlier versions without that marker can be uninstalled normally,
+but the prefix is deliberately retained.
 
 ## Download verification
 

@@ -50,6 +50,7 @@ def main():
     pid, fd = pty.fork()
     if pid == 0:
         os.environ["GLENV_PREFIX"] = PREFIX
+        os.environ["GLENV_TEST_ALLOW_HOST"] = "1"
         os.environ.setdefault("TERM", "xterm-256color")
         os.environ.setdefault("LANG", "C.UTF-8")
         os.execvp("sh", ["sh", INSTALLER])

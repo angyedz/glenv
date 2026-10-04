@@ -23,9 +23,19 @@ set -u
 VERSION="1.0"
 TREE=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
 PREFIX="${GLENV_PREFIX:-/opt/glibc-env}"
+while [ "$PREFIX" != "/" ]; do case "$PREFIX" in */) PREFIX=${PREFIX%/} ;; *) break ;; esac; done
+case "$PREFIX" in
+    /*) ;;
+    *) printf 'GLENV_PREFIX must be an absolute path: %s\n' "$PREFIX" >&2; exit 2 ;;
+esac
+case "$PREFIX" in *[!A-Za-z0-9_./-]*) printf 'GLENV_PREFIX may contain only letters, digits, / . _ and -: %s\n' "$PREFIX" >&2; exit 2 ;; esac
+case "/$PREFIX/" in */../*) printf 'GLENV_PREFIX cannot contain .. path components: %s\n' "$PREFIX" >&2; exit 2 ;; esac
+case "$PREFIX" in /|/opt|/usr|/home|/var|/etc|/root|/tmp|/lib|/bin|/sbin|/srv|/mnt|/media)
+    printf 'GLENV_PREFIX must be a dedicated subdirectory, not a system root: %s\n' "$PREFIX" >&2; exit 2 ;;
+esac
 MIRROR="${GLENV_MIRROR:-https://deb.debian.org/debian}"
-DIST="trixie"
-ARCH="amd64"
+DIST="${GLENV_DIST:-trixie}"
+ARCH="${GLENV_DEBIAN_ARCH:-amd64}"
 GROUPS="core gl x11 gui sound net fonts tools"
 # bind-mount points owned by glenv (integration writes these to /etc/fstab)
 MNTS="/usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu /usr/lib64 /usr/lib/locale /usr/share/i18n /usr/share/glvnd /usr/share/drirc.d"
@@ -67,7 +77,7 @@ now_cs() {
     if read -r _u _rest < /proc/uptime 2>/dev/null; then
         _w=${_u%%.*}
         if [ "$_w" = "$_u" ]; then printf '%s' "$((_w * 100))"
-        else _f=${_u#*.}; printf '%s' "$((_w * 100 + 10#${_f:-0}))"; fi
+        else _f=${_u#*.}; _f=$(printf '%s' "${_f}00" | cut -c1-2); printf '%s' "$((_w * 100 + ${_f:-0}))"; fi
     else
         printf '%s' "$(date +%s)00"
     fi
@@ -107,6 +117,16 @@ hkb() {     # kilobytes -> human
     _k=$1
     if [ "$_k" -ge 1048576 ]; then printf '%d.%d GB' "$((_k / 1048576))" "$(( (_k % 1048576) * 10 / 1048576 ))"
     else printf '%d.%d MB' "$((_k / 1024))" "$(( (_k % 1024) * 10 / 1024 ))"; fi
+}
+file_size() {  # portable GNU/BusyBox stat wrapper; prints 0 on failure
+    _fs=$(stat -c %s "$1" 2>/dev/null) || _fs=$(wc -c < "$1" 2>/dev/null | tr -d ' ')
+    case "$_fs" in ''|*[!0-9]*) _fs=0 ;; esac
+    printf '%s' "$_fs"
+}
+file_mtime() { # portable GNU/BusyBox stat wrapper; prints 0 on failure
+    _fm=$(stat -c %Y "$1" 2>/dev/null) || _fm=0
+    case "$_fm" in ''|*[!0-9]*) _fm=0 ;; esac
+    printf '%s' "$_fm"
 }
 bar_str() { # cur total width -> "████░░░ 67%"
     _c=$1 _t=${2:-0} _w=${3:-24} _p=0
@@ -208,6 +228,8 @@ every downloaded .deb is verified against the SHA256 from the Debian index
 environment:
   GLENV_PREFIX=$PREFIX
   GLENV_MIRROR=$MIRROR
+  GLENV_DIST=$DIST
+  GLENV_DEBIAN_ARCH=$ARCH
 
 stages: preflight, components, plan, privileges, packages, glenv, system,
         verify, done
@@ -221,8 +243,10 @@ fetch_index() {   # -> $PACKAGES (uncompressed) ; non-fatal on failure
     PACKAGES=""
     for f in "$PREFIX/debs/Packages" "$TREE/debs/Packages"; do
         [ -s "$f" ] || continue
-        age=$(( ($(date +%s) - $(stat -c %Y "$f")) / 60 ))
-        if [ "$age" -le 1440 ]; then PACKAGES=$f; inf "index: cached ($(stat -c %s "$f" | tr -d ' ') bytes, ${age}m old)"; break; fi
+        _mtime=$(file_mtime "$f")
+        [ "$_mtime" -gt 0 ] || continue
+        age=$(( ($(date +%s) - _mtime) / 60 ))
+        if [ "$age" -le 1440 ]; then PACKAGES=$f; inf "index: cached ($(file_size "$f") bytes, ${age}m old)"; break; fi
     done
     [ -n "$PACKAGES" ] && return 0
 
@@ -232,7 +256,7 @@ fetch_index() {   # -> $PACKAGES (uncompressed) ; non-fatal on failure
     _wp=$!
     _t0=$(now_cs); _pb=0; _sp=0; _lsize=-1; _lgrow=$_t0
     while kill -0 "$_wp" 2>/dev/null; do
-        _b=$(stat -c %s "$out" 2>/dev/null || echo 0)
+        _b=$(file_size "$out")
         _tn=$(now_cs); _dt=$((_tn - _t0))
         if [ "$_dt" -ge 1 ] && [ "$_b" -gt "$_pb" ]; then
             _sp=$((((_b - _pb)) * 100 / _dt)); _t0=$_tn; _pb=$_b
@@ -246,7 +270,7 @@ fetch_index() {   # -> $PACKAGES (uncompressed) ; non-fatal on failure
         sleep 0.25
     done
     wait "$_wp" 2>/dev/null || true
-    _b=$(stat -c %s "$out" 2>/dev/null || echo 0)
+    _b=$(file_size "$out")
     if [ "$_b" -lt 100000 ]; then
         printf '\r\033[K'
         res warn "index download failed (need network + CA certificates)"
@@ -523,6 +547,7 @@ plan_screen() {
 apk_need() {
     APK_NEED=""
     apk info -e bubblewrap >/dev/null 2>&1 || APK_NEED="bubblewrap"
+    command -v sha256sum >/dev/null 2>&1 || APK_NEED="$APK_NEED coreutils"
     if [ ! -f /etc/ssl/certs/ca-certificates.crt ]; then
         APK_NEED="$APK_NEED ca-certificates"
     fi
@@ -551,9 +576,9 @@ setup_sudo() {
 as_root() { if [ -n "$SUDO" ]; then $SUDO "$@"; else "$@"; fi; }
 
 # ------------------------------------------------------------- download ----
-verify_sha() {   # $1 = file, $2 = expected sha256 (empty or no tool = skip)
-    [ -n "$2" ] || return 0
-    command -v sha256sum >/dev/null 2>&1 || return 0
+verify_sha() {   # $1 = file, $2 = expected sha256 (missing hash/tool = reject)
+    [ -n "$2" ] || return 1
+    command -v sha256sum >/dev/null 2>&1 || return 1
     [ "$(sha256sum "$1" 2>/dev/null | cut -d' ' -f1)" = "$2" ]
 }
 
@@ -596,7 +621,7 @@ download_all() {
             _stall=0; _lsize=-1; _lgrow=$(now_cs); speed=0
             t_prev=$(now_cs); b_prev=0
             while kill -0 "$_wp" 2>/dev/null; do
-                _cur=$(stat -c %s "$_dest.part" 2>/dev/null || echo 0)
+                _cur=$(file_size "$_dest.part")
                 GCUR=$((got + _cur))
                 _tn=$(now_cs); _dt=$((_tn - t_prev))
                 if [ "$_dt" -ge 1 ]; then
@@ -677,7 +702,7 @@ extract_deb() {   # $1 = .deb, $2 = sysroot ; returns 0 ok
             data.tar*|data.tar)
                 _doff=$((_off + 60))
                 tail -c +$((_doff + 1)) "$_deb" > "$TMP/member.bin" || return 1
-                _fsize=$(stat -c %s "$_deb")
+                _fsize=$(file_size "$_deb")
                 if [ $((_doff + _msz + _msz % 2)) -ge "$_fsize" ]; then
                     _data="$TMP/member.bin"
                 else
@@ -728,14 +753,14 @@ extract_all() {
 build_glenv() {
     if [ -d "$TREE/src/glenv" ] && command -v go >/dev/null 2>&1; then
         (cd "$TREE/src/glenv" && go build -trimpath -ldflags "-s -w" -o "$PREFIX/bin/glenv" . 2>"$TMP/go.err") \
-            && res ok "glenv built from source ($(hsize "$(stat -c %s "$PREFIX/bin/glenv")"))" \
+            && res ok "glenv built from source ($(hsize "$(file_size "$PREFIX/bin/glenv")"))" \
             || { [ -s "$TMP/go.err" ] && head -5 "$TMP/go.err" | sed 's/^/          /';
                  [ -x "$TREE/bin/glenv" ] && cp "$TREE/bin/glenv" "$PREFIX/bin/glenv" \
                     && res ok "glenv: build failed, prebuilt binary used" \
                     || die "cannot build glenv and no prebuilt binary"; }
     elif [ -x "$TREE/bin/glenv" ]; then
         cp "$TREE/bin/glenv" "$PREFIX/bin/glenv"
-        res ok "glenv: prebuilt binary ($(hsize "$(stat -c %s "$PREFIX/bin/glenv")"))"
+        res ok "glenv: prebuilt binary ($(hsize "$(file_size "$PREFIX/bin/glenv")"))"
     elif [ -x "$PREFIX/bin/glenv" ]; then
         res same "glenv: binary already present"
     else
@@ -756,7 +781,7 @@ build_glenv() {
         cp "$TREE/lib/glenv-wayland-filter.so" "$_shim"
         res ok "Wayland filter shim copied from tree"
     fi
-    [ -f "$_shim" ] && res ok "Wayland explicit-sync filter: $(hsize "$(stat -c %s "$_shim")")" \
+    [ -f "$_shim" ] && res ok "Wayland explicit-sync filter: $(hsize "$(file_size "$_shim")")" \
                    || res warn "no shim: Wayland screen render fix disabled"
 }
 
@@ -769,15 +794,18 @@ integrate_system() {
 
     # loader
     _ld="$SYS/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
-    if [ -e /lib/ld-linux-x86-64.so.2 ] && ! cmp -s /lib/ld-linux-x86-64.so.2 "$_ld" 2>/dev/null; then
+    if { [ -e /lib/ld-linux-x86-64.so.2 ] || [ -L /lib/ld-linux-x86-64.so.2 ]; } && ! cmp -s /lib/ld-linux-x86-64.so.2 "$_ld" 2>/dev/null; then
         if file_glibc_loader /lib/ld-linux-x86-64.so.2; then
             res same "/lib/ld-linux-x86-64.so.2 already our glibc loader"
         else
-            [ -e /lib/ld-linux-x86-64.so.2.gcompat-shim ] || as_root mv /lib/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2.gcompat-shim
+            if [ -e /lib/ld-linux-x86-64.so.2.gcompat-shim ] || [ -L /lib/ld-linux-x86-64.so.2.gcompat-shim ]; then
+                die "foreign loader exists and /lib/ld-linux-x86-64.so.2.gcompat-shim backup already exists; refusing to overwrite"
+            fi
+            as_root mv /lib/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2.gcompat-shim || die "cannot preserve existing loader"
             as_root cp "$_ld" /lib/ld-linux-x86-64.so.2
             res ok "/lib/ld-linux-x86-64.so.2 <- sysroot (foreign shim kept as *.gcompat-shim)"
         fi
-    elif [ ! -e /lib/ld-linux-x86-64.so.2 ]; then
+    elif [ ! -e /lib/ld-linux-x86-64.so.2 ] && [ ! -L /lib/ld-linux-x86-64.so.2 ]; then
         as_root cp "$_ld" /lib/ld-linux-x86-64.so.2 && res ok "/lib/ld-linux-x86-64.so.2 installed"
     else
         res same "/lib/ld-linux-x86-64.so.2 already ours"
@@ -785,18 +813,51 @@ integrate_system() {
 
     # Debian binaries carry PT_INTERP /lib64/ld-linux-x86-64.so.2 — without this
     # symlink every direct glibc exec fails with "not found" (rc=127)
-    if [ -e /lib64/ld-linux-x86-64.so.2 ]; then
-        res same "/lib64/ld-linux-x86-64.so.2"
+    _p64=/lib64/ld-linux-x86-64.so.2
+    if [ -L "$_p64" ] && [ "$(readlink "$_p64" 2>/dev/null)" = "../lib/ld-linux-x86-64.so.2" ]; then
+        res same "$_p64 -> ../lib/ld-linux-x86-64.so.2"
     else
         [ -d /lib64 ] || [ -L /lib64 ] || as_root mkdir -p /lib64
-        if as_root ln -sfn ../lib/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2; then
-            res ok "/lib64/ld-linux-x86-64.so.2 -> ../lib/ld-linux-x86-64.so.2"
+        if [ -e "$_p64" ] || [ -L "$_p64" ]; then
+            if [ ! -e "$_p64.gcompat-shim" ] && [ ! -L "$_p64.gcompat-shim" ]; then
+                as_root mv "$_p64" "$_p64.gcompat-shim" || res fail "cannot preserve existing $_p64"
+            else
+                res fail "existing $_p64 and backup both present; refusing to overwrite"
+            fi
+        fi
+        if as_root ln -s ../lib/ld-linux-x86-64.so.2 "$_p64"; then
+            res ok "$_p64 -> ../lib/ld-linux-x86-64.so.2 (foreign entry point preserved)"
         else
-            res fail "/lib64/ld-linux-x86-64.so.2 (direct glibc exec will not work)"
+            res fail "$_p64 (direct glibc exec will not work)"
         fi
     fi
 
-    # fstab mounts
+    # fstab mounts: update a previous glenv source when GLENV_PREFIX changes,
+    # but never replace an unrelated administrator mount.
+    _mount_conflicts=0
+    add_bind_mount() {
+        _src=$1; _dst=$2
+        _exact=$(awk -v s="$_src" -v d="$_dst" '$1 == s && $2 == d && $4 ~ /(^|,)bind(,|$)/ {print; exit}' /etc/fstab 2>/dev/null)
+        [ -n "$_exact" ] && return 0
+        _glenv_old=$(awk -v d="$_dst" '$2 == d && $1 ~ /\/sysroot\// && $4 ~ /(^|,)bind(,|$)/ {print; exit}' /etc/fstab 2>/dev/null)
+        if [ -n "$_glenv_old" ]; then
+            awk -v d="$_dst" '$2 == d && $1 ~ /\/sysroot\// && $4 ~ /(^|,)bind(,|$)/ {next} {print}' /etc/fstab > "$TMP/fstab.new" || return 1
+            printf '%s %s none bind 0 0\n' "$_src" "$_dst" >> "$TMP/fstab.new"
+            as_root cp "$TMP/fstab.new" /etc/fstab || return 1
+            _added=$((_added + 1))
+            return 0
+        fi
+        _occupied=$(awk -v d="$_dst" '$2 == d {print; exit}' /etc/fstab 2>/dev/null)
+        if [ -n "$_occupied" ]; then
+            res warn "fstab target $_dst already belongs to another mount; left untouched"
+            return 1
+        fi
+        if [ -s /etc/fstab ] && [ "$(tail -c 1 /etc/fstab 2>/dev/null | wc -l | tr -d ' ')" = 0 ]; then
+            printf '\n' | as_root tee -a /etc/fstab >/dev/null
+        fi
+        printf '%s %s none bind 0 0\n' "$_src" "$_dst" | as_root tee -a /etc/fstab >/dev/null
+        _added=$((_added + 1))
+    }
     for _spec in \
         "$SYS/usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu" \
         "$SYS/usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu" \
@@ -806,19 +867,40 @@ integrate_system() {
         "$SYS/usr/share/glvnd /usr/share/glvnd" \
         "$SYS/usr/share/drirc.d /usr/share/drirc.d"; do
         _src=${_spec% *}; _dst=${_spec#* }
-        grep -q " $_dst " /etc/fstab 2>/dev/null || \
-            { echo "$_src $_dst none bind 0 0" | as_root tee -a /etc/fstab >/dev/null; _added=$((_added + 1)); }
+        mkdir -p "$_src" || die "cannot create sysroot mount source: $_src"
+        add_bind_mount "$_src" "$_dst" || _mount_conflicts=$((_mount_conflicts + 1))
     done
     if [ "$_added" -gt 0 ]; then res ok "/etc/fstab: +$_added bind mounts"; else res same "/etc/fstab: mounts already listed"; fi
+    [ "$_mount_conflicts" -eq 0 ] || res warn "$_mount_conflicts mount target(s) conflict with existing fstab entries"
     as_root mount -a 2>/dev/null || true
-    _up=0
-    for _d in $MNTS; do mount | grep -q " on $_d type" && _up=$((_up + 1)); done
-    if [ "$_up" -eq "$(echo $MNTS | wc -w)" ]; then
-        res ok "bind mounts active: $_up/7"
+    _up=0; _mount_failed=0
+    for _spec in \
+        "$SYS/usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu" \
+        "$SYS/usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu" \
+        "$SYS/usr/lib64 /usr/lib64" \
+        "$SYS/usr/lib/locale /usr/lib/locale" \
+        "$SYS/usr/share/i18n /usr/share/i18n" \
+        "$SYS/usr/share/glvnd /usr/share/glvnd" \
+        "$SYS/usr/share/drirc.d /usr/share/drirc.d"; do
+        _src=${_spec% *}; _dst=${_spec#* }
+        if ! awk -v s="$_src" -v d="$_dst" '$1 == s && $2 == d && $4 ~ /(^|,)bind(,|$)/ {found=1} END {exit !found}' /etc/fstab; then
+            _mount_failed=$((_mount_failed + 1))
+            continue
+        fi
+        if mount | awk -v s="$_src" -v d="$_dst" '$1 == s && $3 == d {found=1} END {exit !found}'; then
+            _up=$((_up + 1))
+            continue
+        fi
+        if mount | awk -v d="$_dst" '$3 == d {found=1} END {exit !found}'; then
+            as_root umount "$_dst" || { _mount_failed=$((_mount_failed + 1)); continue; }
+        fi
+        if as_root mount --bind "$_src" "$_dst"; then _up=$((_up + 1))
+        else _mount_failed=$((_mount_failed + 1)); fi
+    done
+    if [ "$_up" -eq 7 ] && [ "$_mount_failed" -eq 0 ]; then
+        res ok "glenv bind mounts active: $_up/7 (source verified)"
     else
-        as_root sh -c 'mount -a 2>/dev/null'; _up=0
-        for _d in $MNTS; do mount | grep -q " on $_d type" && _up=$((_up + 1)); done
-        res warn "bind mounts active: $_up/7 (reboot may be needed)"
+        res fail "glenv bind mounts active: $_up/7; failed to mount $_mount_failed"
     fi
 
     # ld.so.conf + cache
@@ -838,7 +920,7 @@ CONF
     if [ -x "$_ldc" ]; then as_root "$_ldc" >/dev/null 2>&1 && _ldc_ok=1; fi
     if [ "$_ldc_ok" != 1 ]; then as_root ldconfig >/dev/null 2>&1 || true; fi
     if [ -s /etc/ld.so.cache ]; then
-        res ok "/etc/ld.so.cache rebuilt ($(stat -c %s /etc/ld.so.cache) bytes)"
+        res ok "/etc/ld.so.cache rebuilt ($(file_size /etc/ld.so.cache) bytes)"
     else
         res fail "/etc/ld.so.cache not written — glibc lookup will be slow/broken"
     fi
@@ -935,7 +1017,7 @@ EOF
 
 file_glibc_loader() {   # is this file the real glibc loader (not the gcompat shim)?
     [ -r "$1" ] || return 1
-    [ "$(stat -c %s "$1" 2>/dev/null || echo 0)" -gt 100000 ] && return 0
+    [ "$(file_size "$1")" -gt 100000 ] && return 0
     return 1
 }
 
@@ -988,7 +1070,7 @@ uninstall_plan() {
     [ -L /usr/local/bin/glenv ] || { [ -e /usr/local/bin/glenv ] && _s="not ours — kept" || _s="absent"; }
     printf '          - %-32s %s\n' "/usr/local/bin/glenv" "$_s"
     printf '          - %-32s %s\n' "/lib/ld-linux-x86-64.so.2" "remove loader, restore *.gcompat-shim"
-    printf '          - %-32s %s\n' "/lib64/ld-linux-x86-64.so.2" "remove our symlink"
+    printf '          - %-32s %s\n' "/lib64/ld-linux-x86-64.so.2" "remove our symlink, restore saved entry point"
     printf '          - %-32s %s\n' "user glenv*.desktop entries" "removed"
     if [ "$PURGE" = 1 ]; then
         printf '          %s- %-32s DELETE (--purge)%s\n' "$C_YEL" "prefix $PREFIX" "$C_OFF"
@@ -1084,7 +1166,11 @@ uninstall_system() {
     _p64=/lib64/ld-linux-x86-64.so.2
     if [ -L "$_p64" ] && [ "$(readlink "$_p64" 2>/dev/null)" = "../lib/ld-linux-x86-64.so.2" ]; then
         if as_root rm -f "$_p64"; then
-            res ok "/lib64/ld-linux-x86-64.so.2: symlink removed"
+            if [ -e "$_p64.gcompat-shim" ] || [ -L "$_p64.gcompat-shim" ]; then
+                as_root mv "$_p64.gcompat-shim" "$_p64" && res ok "/lib64/ld-linux-x86-64.so.2: previous entry point restored"
+            else
+                res ok "/lib64/ld-linux-x86-64.so.2: symlink removed"
+            fi
             as_root rmdir /lib64 2>/dev/null || true
         else
             res fail "/lib64/ld-linux-x86-64.so.2: cannot remove"
@@ -1131,22 +1217,29 @@ uninstall_system() {
 
     # 10. optional purge
     if [ "$PURGE" = 1 ]; then
-        case "$PREFIX" in
-            ""|"/"|"/opt"|"/usr"|"/home"|"/var"|"/etc"|"/usr/local")
+        if [ "$_busy" -gt 0 ]; then
+            res fail "refusing purge while $_busy bind mount(s) remain active"
+        else case "$PREFIX" in
+            ""|"/"|"/opt"|"/usr"|"/home"|"/var"|"/etc"|"/root"|"/tmp"|"/lib"|"/bin"|"/sbin"|"/srv"|"/mnt"|"/media"|"/usr/local")
                 res fail "refusing to delete '$PREFIX'" ;;
             *)
                 if [ -d "$PREFIX" ]; then
-                    _pk=$(du -sk "$PREFIX" 2>/dev/null | awk '{print $1}')
-                    case "$_pk" in ''|*[!0-9]*) _pk=0 ;; esac
-                    if as_root rm -rf "$PREFIX"; then
-                        res ok "prefix deleted: $PREFIX ($(hkb "$_pk") freed)"
+                    if ! grep -qx 'glenv managed prefix' "$PREFIX/.glenv-prefix" 2>/dev/null; then
+                        res fail "refusing purge: $PREFIX lacks glenv ownership marker"
                     else
-                        res fail "cannot delete $PREFIX"
+                        _pk=$(du -sk "$PREFIX" 2>/dev/null | awk '{print $1}')
+                        case "$_pk" in ''|*[!0-9]*) _pk=0 ;; esac
+                        if as_root rm -rf "$PREFIX"; then
+                            res ok "prefix deleted: $PREFIX ($(hkb "$_pk") freed)"
+                        else
+                            res fail "cannot delete $PREFIX"
+                        fi
                     fi
                 else
                     res same "prefix already absent: $PREFIX"
                 fi ;;
         esac
+        fi
     else
         res same "prefix kept: $PREFIX (add --purge to delete)"
     fi
@@ -1213,7 +1306,8 @@ uninstall_flow() {
     stage "Done"
     res ok "system integration removed"
     if [ "$PURGE" = 1 ]; then
-        res ok "prefix deleted"
+        if [ ! -d "$PREFIX" ]; then res ok "prefix deleted"
+        else res warn "prefix retained at $PREFIX (purge was refused or failed)"; fi
     else
         res same "prefix kept at $PREFIX"
     fi
@@ -1261,15 +1355,38 @@ main() {
 
     # ---- 1. preflight
     stage "Preflight"
-    [ -f /etc/alpine-release ] && res ok "Alpine $(cat /etc/alpine-release)" || res warn "not Alpine (continuing anyway)"
-    [ "$(uname -m)" = "x86_64" ] && res ok "architecture x86_64" || die "need x86_64 (glibc subsystem is amd64)"
+    if [ -f /etc/alpine-release ]; then
+        _alpine_ver=$(cat /etc/alpine-release)
+        _alpine_major=$(printf '%s' "$_alpine_ver" | awk -F. '{print $1}')
+        _alpine_minor=$(printf '%s' "$_alpine_ver" | awk -F. '{print $2}')
+        case "$_alpine_major:$_alpine_minor" in *[!0-9:]*|:*) die "cannot parse Alpine release: $_alpine_ver" ;; esac
+        [ "$_alpine_major" -eq 3 ] && [ "$_alpine_minor" -ge 20 ] || die "Alpine 3.20 or newer is required (found $_alpine_ver)"
+        res ok "Alpine $_alpine_ver (supported: 3.20+)"
+    elif [ "${GLENV_TEST_ALLOW_HOST:-0}" = 1 ]; then
+        res warn "non-Alpine test host explicitly allowed"
+    else
+        die "this installer supports Alpine Linux only"
+    fi
+    [ "$(uname -m)" = "x86_64" ] && res ok "architecture x86_64" || die "this build supports x86_64 only (Debian amd64 sysroot)"
+    _musl=0
+    for _f in /lib/ld-musl-*.so.1; do [ -e "$_f" ] && _musl=1 && break; done
+    if [ "$_musl" != 1 ] || ! command -v apk >/dev/null 2>&1; then
+        [ "${GLENV_TEST_ALLOW_HOST:-0}" = 1 ] || die "musl + apk required; this glenv build targets Alpine/musl"
+        res warn "musl/apk checks bypassed by test hook"
+    fi
     command -v wget  >/dev/null 2>&1 && res ok "wget (busybox)" || die "need wget"
     command -v awk   >/dev/null 2>&1 && res ok "awk" || die "need awk"
     command -v tar   >/dev/null 2>&1 && res ok "tar" || die "need tar"
     command -v sha256sum >/dev/null 2>&1 && res ok "sha256sum (busybox)" || res warn "sha256sum missing — package hashes will not be verified"
-    command -v unxz  >/dev/null 2>&1 || res warn "unxz missing — .deb extraction will fail"
+    command -v unxz  >/dev/null 2>&1 || die "need unxz (install Alpine package xz)"
+    command -v gzip  >/dev/null 2>&1 || die "need gzip (BusyBox gzip is sufficient)"
+    command -v mount >/dev/null 2>&1 && command -v umount >/dev/null 2>&1 || die "need mount and umount utilities"
     command -v sudo  >/dev/null 2>&1 || [ "$(id -u)" -eq 0 ] || die "need sudo (or run as root)"
-    command -v rc-update >/dev/null 2>&1 || res warn "OpenRC not found (integration step skipped?)"
+    if command -v rc-update >/dev/null 2>&1; then
+        res ok "OpenRC detected"
+    else
+        res warn "OpenRC command not detected; fstab entries are written, but arrange mount -a at boot yourself"
+    fi
     _ddir=$(dirname "$PREFIX"); [ -d "$_ddir" ] || _ddir=/
     FREE_KB=$(df -Pk "$_ddir" 2>/dev/null | awk 'NR==2{print $4}')
     case "$FREE_KB" in ''|*[!0-9]*) FREE_KB=0 ;; esac
@@ -1332,6 +1449,7 @@ main() {
         as_root mkdir -p "$PREFIX" && as_root chown "$(id -un)" "$PREFIX"
     fi
     mkdir -p "$DEBS" "$SYSROOT" "$PREFIX/bin" "$PREFIX/lib"
+    printf '%s\n' 'glenv managed prefix' > "$PREFIX/.glenv-prefix"
     apk_need
     if [ -n "$APK_NEED" ]; then
         inf "apk add $APK_NEED"

@@ -14,10 +14,16 @@ import (
 	"path/filepath"
 )
 
-// Env paths: GLENV_HOME > /opt/glibc-env (system install) > ~/glibc-env.
+// Env paths: GLENV_HOME > prefix next to this executable > /opt/glibc-env > ~/glibc-env.
 func defaultEnvDir() string {
 	if v := os.Getenv("GLENV_HOME"); v != "" {
 		return v
+	}
+	if exe, err := os.Executable(); err == nil {
+		candidate := filepath.Dir(filepath.Dir(exe))
+		if st, err := os.Stat(filepath.Join(candidate, "sysroot")); err == nil && st.IsDir() {
+			return candidate
+		}
 	}
 	if st, err := os.Stat("/opt/glibc-env/sysroot"); err == nil && st.IsDir() {
 		return "/opt/glibc-env"

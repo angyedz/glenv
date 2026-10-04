@@ -1,6 +1,6 @@
 # glenv architecture
 
-glenv runs two userspace systems side by side on one Alpine machine: musl
+This build supports Alpine 3.x / musl / x86_64. glenv runs two userspace systems side by side on one Alpine machine: musl
 (the host, untouched) and glibc (a full Debian trixie userspace kept inside
 `/opt/glibc-env`). No chroot, no container — routing happens at the ELF level.
 

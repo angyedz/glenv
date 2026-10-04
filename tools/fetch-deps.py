@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
 """Debian dependency resolver and package extractor into the glenv sysroot."""
 import os, sys, re, subprocess, urllib.request, glob
+import hashlib
 
 PREFIX = os.environ.get("GLENV_PREFIX") or ("/opt/glibc-env" if os.path.isdir("/opt/glibc-env/sysroot") else os.path.expanduser("~/glibc-env"))
 DEBS = os.path.join(PREFIX, "debs")
 SYSROOT = os.path.join(PREFIX, "sysroot")
-MIRROR = "https://deb.debian.org/debian/"
-DIST = "trixie"
-ARCH = "amd64"
+MIRROR = os.environ.get("GLENV_MIRROR", "https://deb.debian.org/debian").rstrip("/") + "/"
+DIST = os.environ.get("GLENV_DIST", "trixie")
+ARCH = os.environ.get("GLENV_DEBIAN_ARCH", "amd64")
+
+def verify_sha256(path, expected):
+    if not expected:
+        raise RuntimeError("Debian index has no SHA256 for this package")
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    if h.hexdigest() != expected:
+        raise RuntimeError("SHA256 mismatch")
 
 def update_index():
     """Download a fresh Debian Packages index into DEBS/ (for a clean install)."""
@@ -128,9 +139,14 @@ def main():
                 fail += 1
                 continue
         try:
+            verify_sha256(local, pkg.get("SHA256", ""))
             extract(local)
             ok += 1
         except Exception as e:
+            try:
+                os.unlink(local)
+            except OSError:
+                pass
             print(f"[{i}/{total}] EXTRACT FAIL {pkg['Package']}: {e}")
             fail += 1
         if i % 25 == 0 or i == total:

@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Broadened the validated host range to Alpine 3.20+ on x86_64/musl; CI
+  exercises menu/preflight on Alpine 3.20 through 3.24.
+- Installer now validates Alpine/musl/apk, architecture, release floor and
+  required host tools before installation; OpenRC absence is reported as a
+  boot-time mount configuration note, not mistaken for an install failure.
+- Support absolute custom prefixes consistently in `glenv`, tests and repair
+  tooling; reject relative/whitespace/traversal/system-root prefixes.
+- Create absent sysroot bind-mount source directories for minimal component
+  selections and replace stale glenv fstab sources without clobbering foreign
+  mounts.
+- Preserve pre-existing `/lib64/ld-linux-x86-64.so.2` entries and restore them
+  on uninstall; guard `--purge` with an installer ownership marker and refuse
+  purge while mounts remain active.
+- Require real SHA256 validation (no empty-hash/tool-missing bypass); arrange
+  `coreutils` through apk when BusyBox lacks `sha256sum`.
+- `fetch-deps.py` honors mirror/suite/architecture environment settings and
+  verifies package hashes before extraction.
+
 ## [1.0.0] — 2026-10-04
 
 First public release.
