@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  static:
+    name: static checks (syntax, scans, builds)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: lint and scans
+        run: sh tests/scan.sh
+
+  menu:
+    # runs in a real Alpine container so the menu is exercised under BusyBox ash
+    # (the same shell the installer runs on user machines)
+    name: installer menu (pty, BusyBox ash)
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    steps:
+      - name: bootstrap repository (JS actions are unavailable on musl)
+        run: |
+          apk add --no-cache python3 ca-certificates wget
+          wget -qO /tmp/src.tar.gz "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/archive/$GITHUB_SHA.tar.gz"
+          tar -xzf /tmp/src.tar.gz -C /tmp
+          SRC_DIR=$(ls -d /tmp/*"$GITHUB_SHA"* | head -1)
+          cp -a "$SRC_DIR"/. "$GITHUB_WORKSPACE"/
+      - name: pty menu test
+        run: python3 tests/menu-pty.py
+
+  cleanroom:
+    # full cycle on a pristine Alpine: install -> verify -> uninstall -> purge
+    name: clean-room install/uninstall (Alpine chroot)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: chroot clean-room test
+        run: sh tests/chroot-cleanroom.sh
+      - name: upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cleanroom-logs
+          path: /tmp/glenv-cleanroom-*.log
+          if-no-files-found: ignore
