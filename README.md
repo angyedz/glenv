@@ -2,9 +2,9 @@
 
 [![ci](https://github.com/angyedz/glenv/actions/workflows/ci.yml/badge.svg)](https://github.com/angyedz/glenv/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
-[![Alpine](https://img.shields.io/badge/Alpine-3.x%20%7C%20x86__64-orange.svg)](https://alpinelinux.org/)
+[![Alpine](https://img.shields.io/badge/Alpine-3.x-orange.svg)](https://alpinelinux.org/)
 
-Run **glibc programs** on Alpine/musl x86_64 without chroot or containers:
+Run **glibc programs** on Alpine/musl without chroot or containers:
 full Debian trixie userspace (glibc 2.41, GTK, sound, GL/EGL, TLS) + `glenv` router.
 
 ## Quick start
@@ -15,11 +15,12 @@ cd glenv
 sh install.sh
 ```
 
-Supported target: Alpine Linux 3.20+ on x86_64 (musl); CI exercises Alpine
-3.20 through 3.24. OpenRC is the tested init system; on other init systems
-the installer writes fstab entries but you must arrange to mount them at
-boot. Other CPU architectures are not supported by this build (Debian amd64
-packages and x86_64 loader are used).
+Supported and tested target: Alpine Linux 3.20+ on x86_64 (musl); CI exercises
+Alpine 3.20 through 3.24. ARM64/aarch64 support is **incomplete and
+experimental**: installer changes are in progress, and the full install,
+runtime, uninstall and VM test cycle has not been validated. Do not rely on it
+for production. OpenRC is the tested init system; on other init systems the
+installer writes fstab entries but you must arrange to mount them at boot.
 
 One self-contained file (POSIX sh / BusyBox ash — no Python or Go required to
 install), a component menu, a plan screen before any `sudo`, and byte-accurate
@@ -33,7 +34,7 @@ progress bars. The full preset downloads ~147 MB of Debian packages; every
 - **musl** — Alpine host system, works as before.
 - **glibc** — lives only in the `/opt/glibc-env` prefix, does not touch musl system files.
 - **Router** — each binary carries a tag (PT_INTERP): at `execve` the kernel routes
-  a glibc program to `/lib64/ld-linux-x86-64.so.2`, musl ones to the musl loader.
+  a glibc program to the architecture-specific glibc loader, musl ones to the musl loader.
   Our subsystem installs the real glibc loader + `/etc/ld.so.cache` with paths
   into the prefix → `./Randomglibcbinary` works **without flags**.
 - `glenv run --sandbox=... --as=...` flags remain for policies (sandbox, run-as).

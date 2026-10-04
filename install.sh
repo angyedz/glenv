@@ -1,6 +1,6 @@
 #!/bin/sh
 # glenv setup — self-contained installer of the glibc subsystem on Alpine
-# (musl, x86_64, OpenRC). One file, POSIX sh, BusyBox ash compatible:
+# (musl, x86_64/aarch64, OpenRC). One file, POSIX sh, BusyBox ash compatible:
 # no python/go required to install; progress bars, component menu, plan screen.
 #
 #   sh install.sh
@@ -35,10 +35,44 @@ case "$PREFIX" in /|/opt|/usr|/home|/var|/etc|/root|/tmp|/lib|/bin|/sbin|/srv|/m
 esac
 MIRROR="${GLENV_MIRROR:-https://deb.debian.org/debian}"
 DIST="${GLENV_DIST:-trixie}"
-ARCH="${GLENV_DEBIAN_ARCH:-amd64}"
 GROUPS="core gl x11 gui sound net fonts tools"
+
+# ------------------------------------------------------------- target -------
+# This installer supports 64-bit Alpine/musl. The glibc userspace is Debian
+# for the matching CPU architecture; every arch-specific path below is derived
+# from these variables.
+HOST_ARCH=$(uname -m)
+case "$HOST_ARCH" in
+    x86_64)
+        DEB_ARCH_DEFAULT=amd64
+        TRIPLET=x86_64-linux-gnu
+        LOADER_ARCH=ld-linux-x86-64.so.2
+        LOADER_ALIAS_DIR=/lib64          # Debian x86_64 PT_INTERP lives in /lib64
+        ARCH_DESC="x86_64 (Debian amd64)"
+        ;;
+    aarch64|arm64)
+        DEB_ARCH_DEFAULT=arm64
+        TRIPLET=aarch64-linux-gnu
+        LOADER_ARCH=ld-linux-aarch64.so.1
+        LOADER_ALIAS_DIR=""              # arm64 PT_INTERP is /lib/ld-linux-aarch64.so.1
+        ARCH_DESC="aarch64 (Debian arm64)"
+        ;;
+    *)
+        printf 'unsupported architecture: %s (supported: x86_64, aarch64)\n' "$HOST_ARCH" >&2
+        exit 2
+        ;;
+esac
+ARCH="${GLENV_DEBIAN_ARCH:-$DEB_ARCH_DEFAULT}"
+LOADER_HOST="/lib/$LOADER_ARCH"          # where glibc loader replaces the gcompat shim
+LOADER_ALIAS_HOST=""
+[ -n "$LOADER_ALIAS_DIR" ] && LOADER_ALIAS_HOST="$LOADER_ALIAS_DIR/$LOADER_ARCH"
+SYS_TRIPLET_DIR="usr/lib/$TRIPLET"       # inside the sysroot
+SYS_LOADER="$SYS_TRIPLET_DIR/$LOADER_ARCH"
 # bind-mount points owned by glenv (integration writes these to /etc/fstab)
-MNTS="/usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu /usr/lib64 /usr/lib/locale /usr/share/i18n /usr/share/glvnd /usr/share/drirc.d"
+MNTS_ARCH="/usr/lib/$TRIPLET /lib/$TRIPLET"
+[ -n "$LOADER_ALIAS_DIR" ] && MNTS_ARCH="$MNTS_ARCH /usr/lib64"
+MNTS="$MNTS_ARCH /usr/lib/locale /usr/share/i18n /usr/share/glvnd /usr/share/drirc.d"
+N_MNTS=$(echo $MNTS | wc -w | tr -d ' ')
 N_STAGES=9
 STAGE_N=0
 STAGE_T0=0
@@ -295,12 +329,12 @@ write_groups() {
 
 resolve_index() {  # $PACKAGES + $TMP/groups -> $STATS (P/S/M lines)
     STATS="$TMP/stats"
-    awk -v SEL="$TMP/groups" '
+    awk -v SEL="$TMP/groups" -v DEBARCH="$ARCH" '
     function trim(s) { gsub(/^[ \t\r]+|[ \t\r]+$/, "", s); return s }
     function stripver(s) { gsub(/\([^)]*\)/, "", s); return trim(s) }
     function flush(   i, n, a, p) {
         if (cur == "") return
-        if ((arch == "amd64" || arch == "all") && !(cur in V)) {
+        if ((arch == DEBARCH || arch == "all") && !(cur in V)) {
             V[cur] = 1
             F[cur] = file; SZ[cur] = size + 0; ISZ[cur] = isize + 0; DEP[cur] = deps; SH[cur] = shasum
             n = split(prov, a, ",")
@@ -532,14 +566,14 @@ plan_screen() {
     if [ "$FREE_KB" -gt 0 ]; then pl "Free space" " $(hsize "$((FREE_KB * 1024))")"; else pl "Free space" " unknown"; fi
     [ "${MISSING_N:-0}" -gt 0 ] && printf '        %sUnresolvable dependencies%s     %d (usually virtual packages — harmless)\n' "$C_YEL" "$C_OFF" "$MISSING_N"
     printf '\n        %sSystem changes (need root):%s\n' "$C_DIM" "$C_OFF"
-    printf '          + /lib/ld-linux-x86-64.so.2        real glibc loader (gcompat kept as *.gcompat-shim)\n'
-    printf '          + /lib64/ld-linux-x86-64.so.2      symlink (Debian binaries use this PT_INTERP)\n'
-    printf '          + /etc/fstab                       %d bind mounts (persistent)\n' "7"
+    printf '          + %s        real glibc loader (gcompat kept as *.gcompat-shim)\n' "$LOADER_HOST"
+    [ -n "$LOADER_ALIAS_HOST" ] && printf '          + %s      symlink (Debian binaries use this PT_INTERP)\n' "$LOADER_ALIAS_HOST"
+    printf '          + /etc/fstab                       %s bind mounts (persistent)\n' "$N_MNTS"
     printf '          + /etc/ld.so.conf.d/glibc-env.conf glibc library search paths\n'
     printf '          + /etc/ld.so.preload               Wayland explicit-sync filter\n'
     printf '          + /etc/profile.d/glibc-env.sh    PATH -> %s/bin\n' "$PREFIX"
     printf '          + /usr/local/bin/glenv             symlink\n'
-    printf '          + mount --bind x7, ldconfig, localedef (ru_RU, en_US)\n'
+    printf '          + mount --bind x%s, ldconfig, localedef (ru_RU, en_US)\n' "$N_MNTS"
     printf '          + apk add %s\n' "${APK_NEED:-nothing}"
     printf '        %sNothing is changed before you confirm.%s\n' "$C_DIM" "$C_OFF"
 }
@@ -790,34 +824,35 @@ integrate_system() {
     SYS="$SYSROOT"
     _added=0
     for _d in $MNTS; do as_root mkdir -p "$_d" 2>/dev/null; done
-    as_root mkdir -p /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu /usr/lib64 /usr/lib/locale 2>/dev/null
 
     # loader
-    _ld="$SYS/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
-    if { [ -e /lib/ld-linux-x86-64.so.2 ] || [ -L /lib/ld-linux-x86-64.so.2 ]; } && ! cmp -s /lib/ld-linux-x86-64.so.2 "$_ld" 2>/dev/null; then
-        if file_glibc_loader /lib/ld-linux-x86-64.so.2; then
-            res same "/lib/ld-linux-x86-64.so.2 already our glibc loader"
+    _ld="$SYS/usr/lib/$TRIPLET/$LOADER_ARCH"
+    if { [ -e $LOADER_HOST ] || [ -L $LOADER_HOST ]; } && ! cmp -s $LOADER_HOST "$_ld" 2>/dev/null; then
+        if file_glibc_loader $LOADER_HOST; then
+            res same "$LOADER_HOST already our glibc loader"
         else
-            if [ -e /lib/ld-linux-x86-64.so.2.gcompat-shim ] || [ -L /lib/ld-linux-x86-64.so.2.gcompat-shim ]; then
-                die "foreign loader exists and /lib/ld-linux-x86-64.so.2.gcompat-shim backup already exists; refusing to overwrite"
+            if [ -e $LOADER_HOST.gcompat-shim ] || [ -L $LOADER_HOST.gcompat-shim ]; then
+                die "foreign loader exists and $LOADER_HOST.gcompat-shim backup already exists; refusing to overwrite"
             fi
-            as_root mv /lib/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2.gcompat-shim || die "cannot preserve existing loader"
-            as_root cp "$_ld" /lib/ld-linux-x86-64.so.2
-            res ok "/lib/ld-linux-x86-64.so.2 <- sysroot (foreign shim kept as *.gcompat-shim)"
+            as_root mv $LOADER_HOST $LOADER_HOST.gcompat-shim || die "cannot preserve existing loader"
+            as_root cp "$_ld" $LOADER_HOST
+            res ok "$LOADER_HOST <- sysroot (foreign shim kept as *.gcompat-shim)"
         fi
-    elif [ ! -e /lib/ld-linux-x86-64.so.2 ] && [ ! -L /lib/ld-linux-x86-64.so.2 ]; then
-        as_root cp "$_ld" /lib/ld-linux-x86-64.so.2 && res ok "/lib/ld-linux-x86-64.so.2 installed"
+    elif [ ! -e $LOADER_HOST ] && [ ! -L $LOADER_HOST ]; then
+        as_root cp "$_ld" $LOADER_HOST && res ok "$LOADER_HOST installed"
     else
-        res same "/lib/ld-linux-x86-64.so.2 already ours"
+        res same "$LOADER_HOST already ours"
     fi
 
-    # Debian binaries carry PT_INTERP /lib64/ld-linux-x86-64.so.2 — without this
-    # symlink every direct glibc exec fails with "not found" (rc=127)
-    _p64=/lib64/ld-linux-x86-64.so.2
-    if [ -L "$_p64" ] && [ "$(readlink "$_p64" 2>/dev/null)" = "../lib/ld-linux-x86-64.so.2" ]; then
-        res same "$_p64 -> ../lib/ld-linux-x86-64.so.2"
+    # Debian x86_64 binaries carry PT_INTERP $LOADER_ALIAS_HOST — without this
+    # symlink every direct glibc exec fails with "not found" (rc=127).
+    # arm64 has no /lib64; its PT_INTERP is /lib/ld-linux-aarch64.so.1 directly.
+    if [ -n "$LOADER_ALIAS_HOST" ]; then
+    _p64=$LOADER_ALIAS_HOST
+    if [ -L "$_p64" ] && [ "$(readlink "$_p64" 2>/dev/null)" = "..$LOADER_HOST" ]; then
+        res same "$_p64 -> ..$LOADER_HOST"
     else
-        [ -d /lib64 ] || [ -L /lib64 ] || as_root mkdir -p /lib64
+        [ -d "$LOADER_ALIAS_DIR" ] || [ -L "$LOADER_ALIAS_DIR" ] || as_root mkdir -p "$LOADER_ALIAS_DIR"
         if [ -e "$_p64" ] || [ -L "$_p64" ]; then
             if [ ! -e "$_p64.gcompat-shim" ] && [ ! -L "$_p64.gcompat-shim" ]; then
                 as_root mv "$_p64" "$_p64.gcompat-shim" || res fail "cannot preserve existing $_p64"
@@ -825,16 +860,23 @@ integrate_system() {
                 res fail "existing $_p64 and backup both present; refusing to overwrite"
             fi
         fi
-        if as_root ln -s ../lib/ld-linux-x86-64.so.2 "$_p64"; then
-            res ok "$_p64 -> ../lib/ld-linux-x86-64.so.2 (foreign entry point preserved)"
+        if as_root ln -s ..$LOADER_HOST "$_p64"; then
+            res ok "$_p64 -> ..$LOADER_HOST (foreign entry point preserved)"
         else
             res fail "$_p64 (direct glibc exec will not work)"
         fi
+    fi
     fi
 
     # fstab mounts: update a previous glenv source when GLENV_PREFIX changes,
     # but never replace an unrelated administrator mount.
     _mount_conflicts=0
+    mnt_src() {   # host mount point -> sysroot source path
+        case "$1" in
+            /lib/$TRIPLET) printf '%s' "$SYS/usr/lib/$TRIPLET" ;;
+            *)             printf '%s' "$SYS$1" ;;
+        esac
+    }
     add_bind_mount() {
         _src=$1; _dst=$2
         _exact=$(awk -v s="$_src" -v d="$_dst" '$1 == s && $2 == d && $4 ~ /(^|,)bind(,|$)/ {print; exit}' /etc/fstab 2>/dev/null)
@@ -858,15 +900,8 @@ integrate_system() {
         printf '%s %s none bind 0 0\n' "$_src" "$_dst" | as_root tee -a /etc/fstab >/dev/null
         _added=$((_added + 1))
     }
-    for _spec in \
-        "$SYS/usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu" \
-        "$SYS/usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu" \
-        "$SYS/usr/lib64 /usr/lib64" \
-        "$SYS/usr/lib/locale /usr/lib/locale" \
-        "$SYS/usr/share/i18n /usr/share/i18n" \
-        "$SYS/usr/share/glvnd /usr/share/glvnd" \
-        "$SYS/usr/share/drirc.d /usr/share/drirc.d"; do
-        _src=${_spec% *}; _dst=${_spec#* }
+    for _dst in $MNTS; do
+        _src=$(mnt_src "$_dst")
         mkdir -p "$_src" || die "cannot create sysroot mount source: $_src"
         add_bind_mount "$_src" "$_dst" || _mount_conflicts=$((_mount_conflicts + 1))
     done
@@ -874,15 +909,8 @@ integrate_system() {
     [ "$_mount_conflicts" -eq 0 ] || res warn "$_mount_conflicts mount target(s) conflict with existing fstab entries"
     as_root mount -a 2>/dev/null || true
     _up=0; _mount_failed=0
-    for _spec in \
-        "$SYS/usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu" \
-        "$SYS/usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu" \
-        "$SYS/usr/lib64 /usr/lib64" \
-        "$SYS/usr/lib/locale /usr/lib/locale" \
-        "$SYS/usr/share/i18n /usr/share/i18n" \
-        "$SYS/usr/share/glvnd /usr/share/glvnd" \
-        "$SYS/usr/share/drirc.d /usr/share/drirc.d"; do
-        _src=${_spec% *}; _dst=${_spec#* }
+    for _dst in $MNTS; do
+        _src=$(mnt_src "$_dst")
         if ! awk -v s="$_src" -v d="$_dst" '$1 == s && $2 == d && $4 ~ /(^|,)bind(,|$)/ {found=1} END {exit !found}' /etc/fstab; then
             _mount_failed=$((_mount_failed + 1))
             continue
@@ -897,20 +925,18 @@ integrate_system() {
         if as_root mount --bind "$_src" "$_dst"; then _up=$((_up + 1))
         else _mount_failed=$((_mount_failed + 1)); fi
     done
-    if [ "$_up" -eq 7 ] && [ "$_mount_failed" -eq 0 ]; then
-        res ok "glenv bind mounts active: $_up/7 (source verified)"
+    if [ "$_up" -eq "$N_MNTS" ] && [ "$_mount_failed" -eq 0 ]; then
+        res ok "glenv bind mounts active: $_up/$N_MNTS (source verified)"
     else
-        res fail "glenv bind mounts active: $_up/7; failed to mount $_mount_failed"
+        res fail "glenv bind mounts active: $_up/$N_MNTS; failed to mount $_mount_failed"
     fi
 
     # ld.so.conf + cache
     as_root mkdir -p /etc/ld.so.conf.d
-    as_root tee /etc/ld.so.conf.d/glibc-env.conf >/dev/null <<'CONF'
-/usr/lib/x86_64-linux-gnu
-/lib/x86_64-linux-gnu
-/usr/lib64
-/lib64
-CONF
+    {
+        for _d in $MNTS_ARCH; do printf '%s\n' "$_d"; done
+        [ -n "$LOADER_ALIAS_DIR" ] && printf '%s\n' "$LOADER_ALIAS_DIR"
+    } | as_root tee /etc/ld.so.conf.d/glibc-env.conf >/dev/null
     [ -f /etc/ld.so.conf ] || echo "include /etc/ld.so.conf.d/*.conf" | as_root tee /etc/ld.so.conf >/dev/null
     # must be the glibc ldconfig from the sysroot: busybox's `ldconfig` in PATH
     # exits 0 without writing a glibc cache
@@ -937,8 +963,8 @@ CONF
     done
 
     # GDK-Pixbuf + GSettings (only when gui group selected)
-    PXB=/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0
-    _q="$SYS/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders"
+    PXB=/usr/lib/$TRIPLET/gdk-pixbuf-2.0/2.10.0
+    _q="$SYS/usr/lib/$TRIPLET/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders"
     if sel_has gui && [ -x "$_q" ] && [ -d "$SYS$PXB/loaders" ]; then
         if GDK_PIXBUF_MODULEDIR="$PXB/loaders" "$_q" "$PXB"/loaders/*.so \
                 > "$TMP/loaders.cache" 2>/dev/null && [ -s "$TMP/loaders.cache" ]; then
@@ -955,7 +981,7 @@ CONF
         res same "gdk-pixbuf loaders.cache"
     fi
     if sel_has gui && [ -d "$SYS/usr/share/glib-2.0/schemas" ] && [ ! -f "$SYS/usr/share/glib-2.0/schemas/gschemas.compiled" ]; then
-        if "$SYS/usr/lib/x86_64-linux-gnu/glib-2.0/glib-compile-schemas" "$SYS/usr/share/glib-2.0/schemas" 2>/dev/null \
+        if "$SYS/usr/lib/$TRIPLET/glib-2.0/glib-compile-schemas" "$SYS/usr/share/glib-2.0/schemas" 2>/dev/null \
                 && [ -s "$SYS/usr/share/glib-2.0/schemas/gschemas.compiled" ]; then
             res ok "glib gschemas.compiled"
         else
@@ -968,9 +994,9 @@ CONF
 
     # multiarch bin suffixes + SSL path
     _ln=0
-    for _f in "$SYS"/usr/bin/*.x86_64-linux-gnu; do
+    for _f in "$SYS"/usr/bin/*.$TRIPLET; do
         [ -e "$_f" ] || break
-        _b=${_f%.x86_64-linux-gnu}
+        _b=${_f%.$TRIPLET}
         [ -e "$_b" ] || { ln -s "$(basename "$_f")" "$_b"; _ln=$((_ln + 1)); }
     done
     [ "$_ln" -gt 0 ] && res ok "binary name aliases: +$_ln" || res same "binary name aliases"
@@ -1026,12 +1052,12 @@ verify_all() {
     _p=0; _t=0
     chk() { _t=$((_t + 1)); if eval "$2" >/dev/null 2>&1; then _p=$((_p + 1)); res ok "$1"; else res fail "$1"; fi; }
 
-    chk "glibc loader present"            "[ -e /lib/ld-linux-x86-64.so.2 ]"
+    chk "glibc loader present"            "[ -e $LOADER_HOST ]"
     chk "ld.so.cache present"             "[ -s /etc/ld.so.cache ]"
-    chk "sysroot libc present"            "[ -e $SYSROOT/usr/lib/x86_64-linux-gnu/libc.so.6 ]"
-    chk "mount /usr/lib/x86_64-linux-gnu" "mount | grep -q ' on /usr/lib/x86_64-linux-gnu type'"
+    chk "sysroot libc present"            "[ -e $SYSROOT/usr/lib/$TRIPLET/libc.so.6 ]"
+    chk "mount /usr/lib/$TRIPLET" "mount | grep -q ' on /usr/lib/$TRIPLET type'"
     chk "Wayland filter preloaded"        "grep -q glenv-wayland-filter /etc/ld.so.preload"
-    if sel_has sound; then chk "PipeWire client modules" "[ -e $SYSROOT/usr/lib/x86_64-linux-gnu/pipewire-0.3/libpipewire-module-protocol-native.so ]"; fi
+    if sel_has sound; then chk "PipeWire client modules" "[ -e $SYSROOT/usr/lib/$TRIPLET/pipewire-0.3/libpipewire-module-protocol-native.so ]"; fi
     if sel_has net; then chk "CA bundle" "[ -e /usr/lib/ssl/certs/ca-certificates.crt ] || [ -e /etc/ssl/certs/ca-certificates.crt ]"; fi
     chk "glibc binary runs directly"      "[ -x $SYSROOT/usr/bin/hello ] && $SYSROOT/usr/bin/hello"
     chk "glenv command available"         "[ -x $PREFIX/bin/glenv ]"
@@ -1053,7 +1079,7 @@ uninstall_plan() {
     done
     printf '        %sSystem changes to undo (need root):%s\n' "$C_DIM" "$C_OFF"
     printf '          - %-32s %d line(s)\n' "/etc/fstab (glenv binds)" "$_fn"
-    printf '          - %-32s %d/7 active\n' "bind mounts (unmount)" "$_mnt"
+    printf '          - %-32s %d/%s active\n' "bind mounts (unmount)" "$_mnt" "$N_MNTS"
     _s="present"; [ -e /etc/ld.so.conf.d/glibc-env.conf ] || _s="absent"
     printf '          - %-32s %s\n' "/etc/ld.so.conf.d/glibc-env.conf" "$_s"
     _s="present"; [ -e /etc/ld.so.cache ] || _s="absent"
@@ -1069,8 +1095,8 @@ uninstall_plan() {
     _s="symlink"
     [ -L /usr/local/bin/glenv ] || { [ -e /usr/local/bin/glenv ] && _s="not ours — kept" || _s="absent"; }
     printf '          - %-32s %s\n' "/usr/local/bin/glenv" "$_s"
-    printf '          - %-32s %s\n' "/lib/ld-linux-x86-64.so.2" "remove loader, restore *.gcompat-shim"
-    printf '          - %-32s %s\n' "/lib64/ld-linux-x86-64.so.2" "remove our symlink, restore saved entry point"
+    printf '          - %-32s %s\n' "$LOADER_HOST" "remove loader, restore *.gcompat-shim"
+    [ -n "$LOADER_ALIAS_HOST" ] && printf '          - %-32s %s\n' "$LOADER_ALIAS_HOST" "remove our symlink, restore saved entry point"
     printf '          - %-32s %s\n' "user glenv*.desktop entries" "removed"
     if [ "$PURGE" = 1 ]; then
         printf '          %s- %-32s DELETE (--purge)%s\n' "$C_YEL" "prefix $PREFIX" "$C_OFF"
@@ -1139,46 +1165,50 @@ uninstall_system() {
     fi
 
     # 5. glibc loader: remove, restoring the gcompat shim we displaced
-    _ldp=/lib/ld-linux-x86-64.so.2
+    _ldp=$LOADER_HOST
     if [ -e "$_ldp" ] || [ -L "$_ldp" ]; then
         if file_glibc_loader "$_ldp"; then
             if [ -e "$_ldp.gcompat-shim" ]; then
                 if as_root rm -f "$_ldp" && as_root mv "$_ldp.gcompat-shim" "$_ldp"; then
-                    res ok "/lib/ld-linux-x86-64.so.2: gcompat shim restored"
+                    res ok "$LOADER_HOST: gcompat shim restored"
                 else
-                    res fail "/lib/ld-linux-x86-64.so.2: cannot restore shim"
+                    res fail "$LOADER_HOST: cannot restore shim"
                 fi
             else
                 if as_root rm -f "$_ldp"; then
-                    res ok "/lib/ld-linux-x86-64.so.2: glibc loader removed"
+                    res ok "$LOADER_HOST: glibc loader removed"
                 else
-                    res fail "/lib/ld-linux-x86-64.so.2: cannot remove"
+                    res fail "$LOADER_HOST: cannot remove"
                 fi
             fi
         else
-            res same "/lib/ld-linux-x86-64.so.2: not ours — untouched"
+            res same "$LOADER_HOST: not ours — untouched"
         fi
     else
-        res same "/lib/ld-linux-x86-64.so.2: absent"
+        res same "$LOADER_HOST: absent"
     fi
 
-    # 6. /lib64 symlink (only if it is exactly the one we created)
-    _p64=/lib64/ld-linux-x86-64.so.2
-    if [ -L "$_p64" ] && [ "$(readlink "$_p64" 2>/dev/null)" = "../lib/ld-linux-x86-64.so.2" ]; then
+    # 6. loader alias symlink (x86_64 only: /lib64/ld-linux-x86-64.so.2)
+    if [ -n "$LOADER_ALIAS_HOST" ]; then
+    _p64=$LOADER_ALIAS_HOST
+    if [ -L "$_p64" ] && [ "$(readlink "$_p64" 2>/dev/null)" = "..$LOADER_HOST" ]; then
         if as_root rm -f "$_p64"; then
             if [ -e "$_p64.gcompat-shim" ] || [ -L "$_p64.gcompat-shim" ]; then
-                as_root mv "$_p64.gcompat-shim" "$_p64" && res ok "/lib64/ld-linux-x86-64.so.2: previous entry point restored"
+                as_root mv "$_p64.gcompat-shim" "$_p64" && res ok "$LOADER_ALIAS_HOST: previous entry point restored"
             else
-                res ok "/lib64/ld-linux-x86-64.so.2: symlink removed"
+                res ok "$LOADER_ALIAS_HOST: symlink removed"
             fi
-            as_root rmdir /lib64 2>/dev/null || true
+            as_root rmdir "$LOADER_ALIAS_DIR" 2>/dev/null || true
         else
-            res fail "/lib64/ld-linux-x86-64.so.2: cannot remove"
+            res fail "$LOADER_ALIAS_HOST: cannot remove"
         fi
     elif [ -e "$_p64" ]; then
-        res same "/lib64/ld-linux-x86-64.so.2: not our symlink — untouched"
+        res same "$LOADER_ALIAS_HOST: not our symlink — untouched"
     else
-        res same "/lib64/ld-linux-x86-64.so.2: absent"
+        res same "$LOADER_ALIAS_HOST: absent"
+    fi
+    else
+        res same "no loader alias on $HOST_ARCH (PT_INTERP is $LOADER_HOST)"
     fi
 
     # 7. PATH integration
@@ -1250,13 +1280,13 @@ verify_uninstall() {
     chk() { _t=$((_t + 1)); if eval "$2" >/dev/null 2>&1; then _p=$((_p + 1)); res ok "$1"; else res fail "$1"; fi; }
 
     chk "no glenv fstab lines"            "! grep -q \"^$PREFIX/\" /etc/fstab"
-    chk "no x86_64-linux-gnu bind mounts" "! mount | grep -q ' on /usr/lib/x86_64-linux-gnu type'"
+    chk "no $TRIPLET bind mounts"          "! mount | grep -q ' on /usr/lib/$TRIPLET type'"
     chk "no glenv line in ld.so.preload"  "! grep -q glenv-wayland-filter /etc/ld.so.preload"
     chk "no ld.so.conf.d/glibc-env.conf"  "[ ! -e /etc/ld.so.conf.d/glibc-env.conf ]"
     chk "no glibc ld.so.cache"            "[ ! -e /etc/ld.so.cache ]"
     chk "no /etc/profile.d/glibc-env.sh"  "[ ! -e /etc/profile.d/glibc-env.sh ]"
     chk "no /usr/local/bin/glenv"         "[ ! -e /usr/local/bin/glenv ]"
-    chk "glibc loader gone or not ours"   "! file_glibc_loader /lib/ld-linux-x86-64.so.2"
+    chk "glibc loader gone or not ours"   "! file_glibc_loader $LOADER_HOST"
     [ "$PURGE" = 1 ] && chk "prefix deleted" "[ ! -d $PREFIX ]"
 
     if [ "$_p" -eq "$_t" ]; then res ok "$_p/$_t checks passed"; else res warn "$_p/$_t checks passed"; fi
@@ -1269,7 +1299,8 @@ uninstall_flow() {
 
     # ---- 1. preflight (light: no index, no network, no components)
     stage "Preflight"
-    [ "$(uname -m)" = "x86_64" ] && res ok "architecture x86_64" || res warn "not x86_64"
+    [ "$HOST_ARCH" = "x86_64" ] || [ "$HOST_ARCH" = "aarch64" ] || [ "$HOST_ARCH" = "arm64" ] \
+        && res ok "architecture $ARCH_DESC" || res warn "unexpected architecture $HOST_ARCH"
     command -v sudo >/dev/null 2>&1 || [ "$(id -u)" -eq 0 ] || die "need sudo (or run as root)"
     if [ -d "$PREFIX" ]; then
         _pk=$(du -sk "$PREFIX" 2>/dev/null | awk '{print $1}')
@@ -1345,7 +1376,7 @@ main() {
     DEBS="$PREFIX/debs"
     TMP=$(mktemp -d "${TMPDIR:-/tmp}/glenv-setup.XXXXXX") || die "cannot create temp dir"
 
-    printf '\n  %sglenv setup %s%s — glibc subsystem for Alpine (musl, x86_64)\n' "$C_BOLD" "$VERSION" "$C_OFF"
+    printf '\n  %sglenv setup %s%s — glibc subsystem for Alpine (musl, %s)\n' "$C_BOLD" "$VERSION" "$C_OFF" "$ARCH_DESC"
     printf '  %s%s%s\n' "$C_DIM" "----------------------------------------------" "$C_OFF"
 
     if [ "$UNINSTALL" = 1 ]; then
@@ -1367,7 +1398,10 @@ main() {
     else
         die "this installer supports Alpine Linux only"
     fi
-    [ "$(uname -m)" = "x86_64" ] && res ok "architecture x86_64" || die "this build supports x86_64 only (Debian amd64 sysroot)"
+    case "$HOST_ARCH" in
+        x86_64|aarch64|arm64) res ok "architecture $ARCH_DESC" ;;
+        *) die "unsupported architecture: $HOST_ARCH (supported: x86_64, aarch64)" ;;
+    esac
     _musl=0
     for _f in /lib/ld-musl-*.so.1; do [ -e "$_f" ] && _musl=1 && break; done
     if [ "$_musl" != 1 ] || ! command -v apk >/dev/null 2>&1; then
@@ -1473,7 +1507,7 @@ main() {
     [ -s "$LIST" ] || die "empty package list (no index / network?)"
     download_all || die "downloads failed"
     extract_all  || die "extraction failed"
-    # multiarch helper names (glxinfo.x86_64-linux-gnu -> glxinfo) etc. handled in system stage
+    # multiarch helper names (glxinfo.$TRIPLET -> glxinfo) etc. handled in system stage
 
     # ---- 6. glenv
     stage "glenv"

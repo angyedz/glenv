@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Experimental
+
+- Started parameterizing the installer for Debian ARM64/aarch64. ARM64 support
+  is not complete or validated; runtime paths, integration tools, package
+  fetching, and an ARM virtual-machine test still need work.
+
 ### Changed
 
 - Broadened the validated host range to Alpine 3.20+ on x86_64/musl; CI
