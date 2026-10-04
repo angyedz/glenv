@@ -1,0 +1,19 @@
+# generated / downloaded — never commit
+/sysroot/
+/debs/
+/share/
+
+# runtime leftovers
+*.log
+*.part
+*.out
+__pycache__/
+*.pyc
+
+# host-state symlinks (absolute paths, dangling in a fresh clone)
+/bin/zenity
+
+# editor noise
+*.swp
+*~
+.DS_Store

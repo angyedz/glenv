@@ -1,0 +1,10 @@
+# shell scripts are LF everywhere (the installer must run under BusyBox ash)
+*.sh   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+LICENSE text eol=lf
+
+# prebuilt artifacts: never diff, never merge
+bin/glenv            binary
+lib/*.so             binary
