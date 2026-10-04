@@ -209,7 +209,7 @@ glenv/
 
 ```sh
 # router
-cd src/glenv && go build -o ../../bin/glenv .
+cd src/glenv && go build -trimpath -ldflags '-s -w' -o ../../bin/glenv .
 
 # Wayland filter
 gcc -shared -fPIC -O2 -nostdlib -o lib/glenv-wayland-filter.so \

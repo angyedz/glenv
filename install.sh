@@ -727,7 +727,7 @@ extract_all() {
 # ------------------------------------------------------------- glenv -------
 build_glenv() {
     if [ -d "$TREE/src/glenv" ] && command -v go >/dev/null 2>&1; then
-        (cd "$TREE/src/glenv" && go build -o "$PREFIX/bin/glenv" . 2>"$TMP/go.err") \
+        (cd "$TREE/src/glenv" && go build -trimpath -ldflags "-s -w" -o "$PREFIX/bin/glenv" . 2>"$TMP/go.err") \
             && res ok "glenv built from source ($(hsize "$(stat -c %s "$PREFIX/bin/glenv")"))" \
             || { [ -s "$TMP/go.err" ] && head -5 "$TMP/go.err" | sed 's/^/          /';
                  [ -x "$TREE/bin/glenv" ] && cp "$TREE/bin/glenv" "$PREFIX/bin/glenv" \

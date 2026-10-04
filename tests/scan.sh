@@ -43,7 +43,7 @@ fi
 
 # 3. Go sources compile (only if a toolchain is present)
 if command -v go >/dev/null 2>&1 && [ -f src/glenv/go.mod ]; then
-    if (cd src/glenv && go build -o /dev/null . >/dev/null 2>&1); then
+    if (cd src/glenv && go build -trimpath -o /dev/null . >/dev/null 2>&1); then
         ok "go build src/glenv"
     else
         no "go build src/glenv"
@@ -89,14 +89,26 @@ else
     echo "[scan] skip: python3 not available (Cyrillic scan)"
 fi
 
-# 6. no personal data / secrets (skip this file itself: it holds the pattern)
+# 6. no personal data / secrets (assemble patterns so this scanner does not
+#    contain the literal strings it searches for)
+P1="88$(printf '61')"
+P2="rom$(printf 'sez870')"
+P3="gmail$(printf '.com')"
+P4="/home/$(printf 'angyedz')"
 SECRETS=$(printf '%s\n' "$FILES" | grep -v 'tests/scan\.sh$' \
-          | xargs grep -InE '8861|romsez870|gmail\.com|/home/angyedz' 2>/dev/null || true)
+          | xargs grep -InE "$P1|$P2|$P3|$P4" 2>/dev/null || true)
 if [ -z "$SECRETS" ]; then
     ok "no personal data in sources"
 else
     no "personal data found in sources:"
     printf '%s\n' "$SECRETS" | sed 's/^/        /'
+fi
+
+# 7. prebuilt Go binary must not embed the maintainer's checkout path
+if [ -f bin/glenv ] && strings bin/glenv | grep -q '/home/'; then
+    no "bin/glenv embeds a /home/ build path (rebuild with -trimpath)"
+else
+    ok "prebuilt binary has no /home/ build path"
 fi
 
 echo

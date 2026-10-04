@@ -100,7 +100,7 @@ this GL stack cannot produce.
 ## Rebuilds
 
 ```sh
-cd src/glenv && go build -o ../../bin/glenv .
+cd src/glenv && go build -trimpath -ldflags '-s -w' -o ../../bin/glenv .
 gcc -shared -fPIC -O2 -nostdlib -o lib/glenv-wayland-filter.so \
     src/shim/glenv-wayland-filter.c
 ```
