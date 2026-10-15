@@ -257,7 +257,8 @@ usage: sh install.sh [options]
   (no TTY on stdin)      type a line instead of the menu:
                          1|min, 2|std, 3|full, or group names: core,gl,net
 
-every downloaded .deb is verified against the SHA256 from the Debian index
+Debian InRelease signatures, index freshness, package-index hashes, and every
+downloaded .deb SHA256 are verified before extraction
 
 environment:
   GLENV_PREFIX=$PREFIX
@@ -271,52 +272,129 @@ EOF
 }
 
 # ------------------------------------------------------------ preflight -----
-fetch_index() {   # -> $PACKAGES (uncompressed) ; non-fatal on failure
-    local url out age fsize
-    url="$MIRROR/dists/$DIST/main/binary-$ARCH/Packages.xz"
-    PACKAGES=""
-    for f in "$PREFIX/debs/Packages" "$TREE/debs/Packages"; do
-        [ -s "$f" ] || continue
-        _mtime=$(file_mtime "$f")
-        [ "$_mtime" -gt 0 ] || continue
-        age=$(( ($(date +%s) - _mtime) / 60 ))
-        if [ "$age" -le 1440 ]; then PACKAGES=$f; inf "index: cached ($(file_size "$f") bytes, ${age}m old)"; break; fi
+debian_keyring() {
+    for _keyring in /usr/share/keyrings/debian-archive-keyring.pgp \
+                    /usr/share/keyrings/debian-archive-keyring.gpg; do
+        [ -s "$_keyring" ] && { printf '%s\n' "$_keyring"; return 0; }
     done
-    [ -n "$PACKAGES" ] && return 0
+    return 1
+}
 
-    out="$TMP/Packages.xz"
-    inf "index: $url"
-    wget -q -T 60 -O "$out" "$url" 2>/dev/null &
-    _wp=$!
-    _t0=$(now_cs); _pb=0; _sp=0; _lsize=-1; _lgrow=$_t0
-    while kill -0 "$_wp" 2>/dev/null; do
-        _b=$(file_size "$out")
-        _tn=$(now_cs); _dt=$((_tn - _t0))
-        if [ "$_dt" -ge 1 ] && [ "$_b" -gt "$_pb" ]; then
-            _sp=$((((_b - _pb)) * 100 / _dt)); _t0=$_tn; _pb=$_b
+verify_index_bundle() {   # $1=InRelease $2=Packages.xz $3=verified Release output
+    _inrelease=$1; _packages_xz=$2; _release=$3
+    _keyring=$(debian_keyring) || { INDEX_ERROR="Debian archive keyring is missing"; return 1; }
+    command -v gpgv >/dev/null 2>&1 || { INDEX_ERROR="gpgv is missing"; return 1; }
+    command -v sha256sum >/dev/null 2>&1 || { INDEX_ERROR="sha256sum is missing"; return 1; }
+    command -v unxz >/dev/null 2>&1 || { INDEX_ERROR="unxz is missing"; return 1; }
+    gpgv --keyring "$_keyring" --output "$_release" "$_inrelease" >/dev/null 2>&1 \
+        || { INDEX_ERROR="Debian InRelease signature is invalid"; return 1; }
+
+    _codename=$(awk -F': ' '$1 == "Codename" { print $2; exit }' "$_release")
+    [ "$_codename" = "$DIST" ] || { INDEX_ERROR="signed index codename mismatch"; return 1; }
+    _archs=$(awk -F': ' '$1 == "Architectures" { print " " $2 " "; exit }' "$_release")
+    case "$_archs" in *" $ARCH "*) ;; *) INDEX_ERROR="signed index does not include $ARCH"; return 1 ;; esac
+    _components=$(awk -F': ' '$1 == "Components" { print " " $2 " "; exit }' "$_release")
+    case "$_components" in *" main "*) ;; *) INDEX_ERROR="signed index does not include main"; return 1 ;; esac
+
+    _release_date=$(awk -F': ' '$1 == "Date" { print $2; exit }' "$_release")
+    [ -n "$_release_date" ] || { INDEX_ERROR="signed index has no Date"; return 1; }
+    _release_epoch=$(date -u -d "$_release_date" +%s 2>/dev/null) || { INDEX_ERROR="cannot parse Debian Date"; return 1; }
+    _now=$(date -u +%s 2>/dev/null) || { INDEX_ERROR="cannot read system time"; return 1; }
+    case "$_release_epoch:$_now" in *[!0-9:]*) INDEX_ERROR="invalid Debian Date timestamp"; return 1 ;; esac
+    [ "$_release_epoch" -le $((_now + 600)) ] || { INDEX_ERROR="signed Debian index Date is in the future"; return 1; }
+    _valid_until=$(awk -F': ' '$1 == "Valid-Until" { print $2; exit }' "$_release")
+    if [ -n "$_valid_until" ]; then
+        _expiry=$(date -u -d "$_valid_until" +%s 2>/dev/null) || { INDEX_ERROR="cannot parse Debian Valid-Until"; return 1; }
+        case "$_expiry" in ''|*[!0-9]*) INDEX_ERROR="invalid Debian Valid-Until timestamp"; return 1 ;; esac
+        [ "$_expiry" -gt "$_now" ] || { INDEX_ERROR="signed Debian index has expired"; return 1; }
+    fi
+
+    # Debian stable releases may omit Valid-Until. Preserve the latest signed
+    # Release date we've accepted so a mirror cannot roll the local index back.
+    if [ -s "$PREFIX/debs/InRelease" ] && [ "$_inrelease" != "$PREFIX/debs/InRelease" ]; then
+        _cached_release="$TMP/Previous-Release"
+        if gpgv --keyring "$_keyring" --output "$_cached_release" "$PREFIX/debs/InRelease" >/dev/null 2>&1; then
+            _cached_date=$(awk -F': ' '$1 == "Date" { print $2; exit }' "$_cached_release")
+            _cached_epoch=$(date -u -d "$_cached_date" +%s 2>/dev/null) || _cached_epoch=""
+            case "$_cached_epoch" in ''|*[!0-9]*) ;; *)
+                [ "$_release_epoch" -ge "$_cached_epoch" ] \
+                    || { INDEX_ERROR="signed Debian index is older than the previously accepted index"; return 1; } ;;
+            esac
         fi
-        if [ "$_b" -gt "$_lsize" ]; then
-            _lsize=$_b; _lgrow=$_tn
-        elif [ $((_tn - _lgrow)) -gt 4500 ]; then
-            kill "$_wp" 2>/dev/null; break
-        fi
-        printf '\r        %sPackages.xz%s  %s  %s   \033[K' "$G_ARR" "$C_OFF" "$(hsize "$_b")" "$([ "$_sp" -gt 0 ] 2>/dev/null && fmt_speed "$_sp" || printf -- '--')"
-        sleep 0.25
-    done
-    wait "$_wp" 2>/dev/null || true
-    _b=$(file_size "$out")
-    if [ "$_b" -lt 100000 ]; then
-        printf '\r\033[K'
-        res warn "index download failed (need network + CA certificates)"
+    fi
+
+    _expected=$(awk -v path="main/binary-$ARCH/Packages.xz" '
+        /^SHA256:/ { in_sha = 1; next }
+        /^[^ ]/ { if (in_sha) exit; next }
+        in_sha && $3 == path { print $1 " " $2; exit }
+    ' "$_release")
+    set -- $_expected
+    _sha=$1; _size=$2
+    case "$_sha" in
+        ''|*[!0-9a-fA-F]*) INDEX_ERROR="signed index has no SHA256 for Packages.xz"; return 1 ;;
+    esac
+    [ "${#_sha}" -eq 64 ] || { INDEX_ERROR="signed index has malformed Packages.xz SHA256"; return 1; }
+    case "$_size" in ''|*[!0-9]*) INDEX_ERROR="signed index has malformed Packages.xz size"; return 1 ;; esac
+    [ "$(file_size "$_packages_xz")" = "$_size" ] \
+        || { INDEX_ERROR="Packages.xz size does not match signed index"; return 1; }
+    [ "$(sha256sum "$_packages_xz" 2>/dev/null | awk '{print $1}')" = "$_sha" ] \
+        || { INDEX_ERROR="Packages.xz SHA256 does not match signed index"; return 1; }
+    return 0
+}
+
+load_cached_index() {
+    _cache="$PREFIX/debs"
+    [ -s "$_cache/InRelease" ] && [ -s "$_cache/Packages.xz" ] || return 1
+    _mtime=$(file_mtime "$_cache/InRelease")
+    [ "$_mtime" -gt 0 ] || return 1
+    _age=$(( ($(date +%s) - _mtime) / 60 ))
+    [ "$_age" -le 1440 ] || return 1
+    INDEX_ERROR=""
+    if ! verify_index_bundle "$_cache/InRelease" "$_cache/Packages.xz" "$TMP/Release"; then
+        res warn "cached Debian index rejected: $INDEX_ERROR"
         return 1
     fi
-    if unxz -c "$out" > "$TMP/Packages" 2>/dev/null; then
-        printf '\r        %sPackages.xz%s  %s  %s\n\033[K' "$G_ARR" "$C_OFF" "$(hsize "$_b")" "ok"
-        PACKAGES=$TMP/Packages
-        return 0
+    unxz -c "$_cache/Packages.xz" > "$TMP/Packages" 2>/dev/null || return 1
+    INDEX_INRELEASE="$_cache/InRelease"
+    INDEX_PACKAGES_XZ="$_cache/Packages.xz"
+    PACKAGES="$TMP/Packages"
+    inf "index: cached and signature verified (${_age}m old)"
+    return 0
+}
+
+fetch_index() {   # -> $PACKAGES (uncompressed); only accepts signed, fresh metadata
+    local base inrelease packages_xz
+    PACKAGES=""
+    INDEX_ERROR=""
+    if ! command -v gpgv >/dev/null 2>&1 || ! debian_keyring >/dev/null 2>&1 || \
+       ! command -v sha256sum >/dev/null 2>&1 || ! command -v unxz >/dev/null 2>&1; then
+        INDEX_ERROR="signature verification prerequisites are not installed"
+        return 1
     fi
-    printf '\r\033[K'
-    res warn "index decompression failed"
+    base="$MIRROR/dists/$DIST"
+    inrelease="$TMP/InRelease"
+    packages_xz="$TMP/Packages.xz"
+    if wget -q -T 60 -O "$inrelease" "$base/InRelease" 2>/dev/null && [ -s "$inrelease" ]; then
+        if wget -q -T 60 -O "$packages_xz" "$base/main/binary-$ARCH/Packages.xz" 2>/dev/null && [ -s "$packages_xz" ]; then
+            if verify_index_bundle "$inrelease" "$packages_xz" "$TMP/Release"; then
+                unxz -c "$packages_xz" > "$TMP/Packages" 2>/dev/null || {
+                    INDEX_ERROR="verified Packages.xz could not be decompressed"; return 1;
+                }
+                INDEX_INRELEASE="$inrelease"
+                INDEX_PACKAGES_XZ="$packages_xz"
+                PACKAGES="$TMP/Packages"
+                res ok "Debian InRelease signature, freshness, index hash, and $ARCH codename verified"
+                return 0
+            fi
+        else
+            INDEX_ERROR="could not download Packages.xz"
+        fi
+    else
+        INDEX_ERROR="could not download Debian InRelease"
+    fi
+    res warn "fresh Debian index unavailable: $INDEX_ERROR"
+    load_cached_index && return 0
+    PACKAGES=""
     return 1
 }
 
@@ -550,7 +628,7 @@ plan_screen() {
     apk_need
     pl "Alpine packages (apk)" " ${APK_NEED:-nothing}"
     if [ -n "${PACKAGES:-}" ]; then
-        pl "Debian packages" " $SEL_CNT · $(hsize "$SEL_BYTES") download · $(hkb "$SEL_KB") on disk"
+        pl "Debian packages (signed index)" " $SEL_CNT · $(hsize "$SEL_BYTES") download · $(hkb "$SEL_KB") on disk"
         for _g in $GROUPS; do
             sel_has "$_g" || continue
             eval "_c=\$CNT_$_g; _b=\$BY_$_g; _k=\$KB_$_g"
@@ -582,6 +660,8 @@ apk_need() {
     APK_NEED=""
     apk info -e bubblewrap >/dev/null 2>&1 || APK_NEED="bubblewrap"
     command -v sha256sum >/dev/null 2>&1 || APK_NEED="$APK_NEED coreutils"
+    command -v gpgv >/dev/null 2>&1 || APK_NEED="$APK_NEED gpgv"
+    debian_keyring >/dev/null 2>&1 || APK_NEED="$APK_NEED debian-archive-keyring"
     if [ ! -f /etc/ssl/certs/ca-certificates.crt ]; then
         APK_NEED="$APK_NEED ca-certificates"
     fi
@@ -1411,7 +1491,10 @@ main() {
     command -v wget  >/dev/null 2>&1 && res ok "wget (busybox)" || die "need wget"
     command -v awk   >/dev/null 2>&1 && res ok "awk" || die "need awk"
     command -v tar   >/dev/null 2>&1 && res ok "tar" || die "need tar"
-    command -v sha256sum >/dev/null 2>&1 && res ok "sha256sum (busybox)" || res warn "sha256sum missing — package hashes will not be verified"
+    command -v sha256sum >/dev/null 2>&1 && res ok "sha256sum" || res warn "sha256sum missing — coreutils will be included in the confirmed prerequisites"
+    command -v gpgv >/dev/null 2>&1 && debian_keyring >/dev/null 2>&1 \
+        && res ok "Debian archive signature verifier and keyring" \
+        || res warn "Debian signature verifier/keyring missing — signed index will be fetched after prerequisite approval"
     command -v unxz  >/dev/null 2>&1 || die "need unxz (install Alpine package xz)"
     command -v gzip  >/dev/null 2>&1 || die "need gzip (BusyBox gzip is sufficient)"
     command -v mount >/dev/null 2>&1 && command -v umount >/dev/null 2>&1 || die "need mount and umount utilities"
@@ -1479,26 +1562,50 @@ main() {
     stage "Privileges"
     setup_sudo
     [ -n "$SUDO" ] && res ok "root access granted ($SUDO)" || res ok "running as root"
-    if [ ! -d "$PREFIX" ]; then
-        as_root mkdir -p "$PREFIX" && as_root chown "$(id -un)" "$PREFIX"
-    fi
-    mkdir -p "$DEBS" "$SYSROOT" "$PREFIX/bin" "$PREFIX/lib"
-    printf '%s\n' 'glenv managed prefix' > "$PREFIX/.glenv-prefix"
     apk_need
     if [ -n "$APK_NEED" ]; then
         inf "apk add $APK_NEED"
         if as_root apk add --no-cache $APK_NEED >/dev/null 2>&1; then
             res ok "apk packages installed: $APK_NEED"
         else
-            res warn "apk add failed (offline?) — some features may be missing"
+            apk_need
+            if ! command -v gpgv >/dev/null 2>&1 || ! debian_keyring >/dev/null 2>&1 || \
+               ! command -v sha256sum >/dev/null 2>&1; then
+                die "cannot install the Debian signature verifier, keyring, and SHA256 tool; refusing unsigned package metadata"
+            fi
+            res warn "apk add failed (offline?) — continuing because required verification tools are available"
         fi
     else
         res same "apk: nothing to install"
     fi
-    # keep the index inside the prefix for later runs
-    if [ -n "${PACKAGES:-}" ] && [ "$PACKAGES" != "$DEBS/Packages" ] && [ -f "$PACKAGES" ]; then
-        cp "$PACKAGES" "$DEBS/Packages" 2>/dev/null && PACKAGES="$DEBS/Packages"
+    if [ -z "${PACKAGES:-}" ]; then
+        fetch_index || die "cannot obtain authenticated Debian package metadata: ${INDEX_ERROR:-verification failed}"
+        write_groups
+        resolve_index || die "dependency resolution failed for authenticated Debian metadata"
+        load_stats
+        sel_stats
+        build_list
+        stage "Verified plan"
+        plan_screen
+        if ! confirm; then
+            printf '  %scancelled — prerequisite packages may have been installed; glenv changes were not applied%s\n\n' "$C_YEL" "$C_OFF"
+            exit 0
+        fi
+        res ok "verified package plan confirmed"
     fi
+    if [ ! -d "$PREFIX" ]; then
+        as_root mkdir -p "$PREFIX" && as_root chown "$(id -un)" "$PREFIX"
+    fi
+    mkdir -p "$DEBS" "$SYSROOT" "$PREFIX/bin" "$PREFIX/lib"
+    printf '%s\n' 'glenv managed prefix' > "$PREFIX/.glenv-prefix"
+    # Persist only the authenticated bundle so cached indices are re-verified on every run.
+    [ -n "${INDEX_INRELEASE:-}" ] && cp "$INDEX_INRELEASE" "$DEBS/InRelease" \
+        || die "verified Debian InRelease is unavailable"
+    [ -n "${INDEX_PACKAGES_XZ:-}" ] && cp "$INDEX_PACKAGES_XZ" "$DEBS/Packages.xz" \
+        || die "verified Debian Packages.xz is unavailable"
+    [ -n "${PACKAGES:-}" ] && cp "$PACKAGES" "$DEBS/Packages" \
+        || die "verified Debian Packages index is unavailable"
+    PACKAGES="$DEBS/Packages"
 
     # ---- 5. packages
     stage "Packages"

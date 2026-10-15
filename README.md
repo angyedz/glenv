@@ -24,8 +24,11 @@ installer writes fstab entries but you must arrange to mount them at boot.
 
 One self-contained file (POSIX sh / BusyBox ash — no Python or Go required to
 install), a component menu, a plan screen before any `sudo`, and byte-accurate
-progress bars. The full preset downloads ~147 MB of Debian packages; every
-`.deb` is verified against the SHA256 from the Debian package index.
+progress bars. The full preset downloads ~147 MB of Debian packages. The
+installer verifies Debian's signed `InRelease`, codename, architecture, optional
+`Valid-Until`, and the `Packages.xz` size and SHA256 before resolving or
+downloading packages. Cached indexes are re-verified and expire after 24 hours;
+every `.deb` is then checked against its authenticated package-index SHA256.
 
 ![installer](docs/screenshot.png)
 
@@ -244,7 +247,7 @@ All three run in CI on every push ([.github/workflows/ci.yml](.github/workflows/
 
 GPL-3.0-only — see [LICENSE](LICENSE). The Debian packages downloaded by the
 installer remain under their own licenses; this project only fetches and
-verifies them (SHA256 from the Debian package index over HTTPS).
+verifies them through Debian's signed release metadata and package SHA256 hashes.
 
 **Disclaimer:** this is not an official Alpine or Debian project. It replaces
 the system dynamic loader entry point — read the plan screen, and use
