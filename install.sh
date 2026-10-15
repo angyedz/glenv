@@ -789,6 +789,7 @@ apk_need() {
     command -v sha256sum >/dev/null 2>&1 || APK_NEED="$APK_NEED coreutils"
     command -v gpgv >/dev/null 2>&1 || APK_NEED="$APK_NEED gpgv"
     debian_keyring >/dev/null 2>&1 || APK_NEED="$APK_NEED debian-archive-keyring"
+    command -v zstd >/dev/null 2>&1 || APK_NEED="$APK_NEED zstd"
     if [ ! -f /etc/ssl/certs/ca-certificates.crt ]; then
         APK_NEED="$APK_NEED ca-certificates"
     fi
@@ -954,6 +955,7 @@ extract_deb() {   # $1 = .deb, $2 = sysroot ; returns 0 ok
                 case "$_mname" in
                     *.xz|*.lzma) unxz -c "$_data" | tar -x -C "$_out" ;;
                     *.gz|*.gzip) gzip -dc "$_data" | tar -x -C "$_out" ;;
+                    *.zst)       zstd -dc "$_data" | tar -x -C "$_out" ;;
                     data.tar)    tar -xf "$_data" -C "$_out" ;;
                     *) set +o pipefail; rm -f "$TMP/member.bin" "$TMP/data.bin"; return 2 ;;
                 esac

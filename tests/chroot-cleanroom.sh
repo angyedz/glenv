@@ -104,6 +104,7 @@ assert "install log says finished"        grep -q "installation finished" "$INST
 assert "install log says 9/9 checks"      grep -q "9/9 checks passed" "$INSTALL_LOG"
 assert "Debian signed index verified"       grep -q "InRelease signature, freshness, index hash" "$INSTALL_LOG"
 assert "sha256 verified message"          grep -q "sha256 verified" "$INSTALL_LOG"
+assert "zstd installed for Debian archives" chroot "$ROOTFS" sh -c 'command -v zstd >/dev/null'
 assert "glibc loader installed"           test -s "$ROOTFS/lib/ld-linux-x86-64.so.2"
 assert "/lib64 symlink created"           test -L "$ROOTFS/lib64/ld-linux-x86-64.so.2"
 assert "ld.so.cache non-empty"            test -s "$ROOTFS/etc/ld.so.cache"
