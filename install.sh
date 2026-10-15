@@ -537,8 +537,8 @@ resolve_index() {  # $PACKAGES + $TMP/groups -> $STATS (P/S/M lines)
         else if (key == "Filename") file = val
         else if (key == "Size") size = val
         else if (key == "Installed-Size") isize = val
-        else if (key == "Depends") deps = val
-        else if (key == "Pre-Depends") deps = deps ", " val
+        else if (key == "Depends") deps = (deps == "" ? val : deps ", " val)
+        else if (key == "Pre-Depends") deps = (deps == "" ? val : deps ", " val)
         else if (key == "SHA256") shasum = val
         else if (key == "Provides") prov = val
         else if (key == "Architecture") arch = val
@@ -576,6 +576,7 @@ resolve_index() {  # $PACKAGES + $TMP/groups -> $STATS (P/S/M lines)
                 if (d == "") continue
                 ng = split(d, grps, ",")
                 for (i = 1; i <= ng; i++) {
+                    if (trim(grps[i]) == "") continue
                     na = split(grps[i], alts, "|")
                     chosen = 0
                     for (j = 1; j <= na; j++) {
