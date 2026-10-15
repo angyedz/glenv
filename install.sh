@@ -280,6 +280,24 @@ debian_keyring() {
     return 1
 }
 
+debian_date_epoch() {   # Parse Debian's RFC 2822 UTC dates using BusyBox or GNU date.
+    _dde_iso=$(printf '%s\n' "$1" | awk '
+        BEGIN {
+            month["Jan"]="01"; month["Feb"]="02"; month["Mar"]="03"; month["Apr"]="04"
+            month["May"]="05"; month["Jun"]="06"; month["Jul"]="07"; month["Aug"]="08"
+            month["Sep"]="09"; month["Oct"]="10"; month["Nov"]="11"; month["Dec"]="12"
+        }
+        NF != 6 || $1 !~ /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun),$/ ||
+        $2 !~ /^[0-9][0-9]?$/ || !($3 in month) ||
+        $4 !~ /^[0-9][0-9][0-9][0-9]$/ ||
+        $5 !~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/ ||
+        ($6 != "UTC" && $6 != "+0000") { exit 1 }
+        { printf "%04d-%s-%02d %s\n", $4, month[$3], $2, $5 }
+    ') || return 1
+    [ -n "$_dde_iso" ] || return 1
+    date -u -d "$_dde_iso" +%s 2>/dev/null
+}
+
 verify_index_bundle() {   # $1=InRelease $2=Packages.xz $3=verified Release output
     _inrelease=$1; _packages_xz=$2; _release=$3
     _keyring=$(debian_keyring) || { INDEX_ERROR="Debian archive keyring is missing"; return 1; }
@@ -298,13 +316,13 @@ verify_index_bundle() {   # $1=InRelease $2=Packages.xz $3=verified Release outp
 
     _release_date=$(awk -F': ' '$1 == "Date" { print $2; exit }' "$_release")
     [ -n "$_release_date" ] || { INDEX_ERROR="signed index has no Date"; return 1; }
-    _release_epoch=$(date -u -d "$_release_date" +%s 2>/dev/null) || { INDEX_ERROR="cannot parse Debian Date"; return 1; }
+    _release_epoch=$(debian_date_epoch "$_release_date") || { INDEX_ERROR="cannot parse Debian Date"; return 1; }
     _now=$(date -u +%s 2>/dev/null) || { INDEX_ERROR="cannot read system time"; return 1; }
     case "$_release_epoch:$_now" in *[!0-9:]*) INDEX_ERROR="invalid Debian Date timestamp"; return 1 ;; esac
     [ "$_release_epoch" -le $((_now + 600)) ] || { INDEX_ERROR="signed Debian index Date is in the future"; return 1; }
     _valid_until=$(awk -F': ' '$1 == "Valid-Until" { print $2; exit }' "$_release")
     if [ -n "$_valid_until" ]; then
-        _expiry=$(date -u -d "$_valid_until" +%s 2>/dev/null) || { INDEX_ERROR="cannot parse Debian Valid-Until"; return 1; }
+        _expiry=$(debian_date_epoch "$_valid_until") || { INDEX_ERROR="cannot parse Debian Valid-Until"; return 1; }
         case "$_expiry" in ''|*[!0-9]*) INDEX_ERROR="invalid Debian Valid-Until timestamp"; return 1 ;; esac
         [ "$_expiry" -gt "$_now" ] || { INDEX_ERROR="signed Debian index has expired"; return 1; }
     fi
@@ -315,7 +333,7 @@ verify_index_bundle() {   # $1=InRelease $2=Packages.xz $3=verified Release outp
         _cached_release="$TMP/Previous-Release"
         if gpgv --keyring "$_keyring" --output "$_cached_release" "$PREFIX/debs/InRelease" >/dev/null 2>&1; then
             _cached_date=$(awk -F': ' '$1 == "Date" { print $2; exit }' "$_cached_release")
-            _cached_epoch=$(date -u -d "$_cached_date" +%s 2>/dev/null) || _cached_epoch=""
+            _cached_epoch=$(debian_date_epoch "$_cached_date") || _cached_epoch=""
             case "$_cached_epoch" in ''|*[!0-9]*) ;; *)
                 [ "$_release_epoch" -ge "$_cached_epoch" ] \
                     || { INDEX_ERROR="signed Debian index is older than the previously accepted index"; return 1; } ;;
