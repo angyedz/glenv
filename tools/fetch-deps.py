@@ -8,6 +8,7 @@ import lzma
 import os
 import re
 import shutil
+import stat
 import tarfile
 import subprocess
 import sys
@@ -558,6 +559,39 @@ def verify_local_deb(path, index):
     verify_sha256(path, pkg.get("SHA256", ""))
     return pkg
 
+def snapshot_local_deb(path, expected_sha256, destination_dir):
+    """Copy an authenticated local archive into private storage before extraction."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        source_fd = os.open(path, flags)
+    except OSError as error:
+        raise RuntimeError("cannot safely open local .deb: " + str(error))
+    snapshot = None
+    try:
+        if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+            raise RuntimeError("local .deb must be a regular file")
+        digest = hashlib.sha256()
+        with os.fdopen(source_fd, "rb") as source:
+            source_fd = None
+            with tempfile.NamedTemporaryFile(prefix="glenv-local-deb-", dir=destination_dir,
+                                             delete=False) as target:
+                snapshot = target.name
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    target.write(block)
+                    digest.update(block)
+                target.flush()
+                os.fsync(target.fileno())
+        if digest.hexdigest() != expected_sha256:
+            raise RuntimeError("SHA256 mismatch")
+        return snapshot
+    except Exception:
+        if snapshot and os.path.lexists(snapshot):
+            os.unlink(snapshot)
+        raise
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+
 def extract(deb_path, destination):
     members = _ar_members(deb_path)
     data_members = [member for member in members
@@ -926,8 +960,7 @@ def main():
             downloaded = []
             for number, pkg in enumerate(pkgs, 1):
                 if local_deb and pkg["Package"] == local_pkg["Package"]:
-                    path = local_deb
-                    verify_sha256(path, pkg.get("SHA256", ""))
+                    path = snapshot_local_deb(local_deb, pkg.get("SHA256", ""), download_dir)
                 else:
                     path = _download_verified(pkg, download_dir)
                 extract(path, stage)

@@ -109,6 +109,21 @@ class ExtractionAndRollbackTests(unittest.TestCase):
             finally:
                 fetch.ARCH = previous_arch
 
+    def test_local_deb_is_snapshotted_and_hashed_before_extraction(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "sample.deb")
+            with open(source, "wb") as stream:
+                stream.write(b"authenticated archive")
+            digest = hashlib.sha256(b"authenticated archive").hexdigest()
+            snapshot = fetch.snapshot_local_deb(source, digest, root)
+            with open(source, "wb") as stream:
+                stream.write(b"replaced after verification")
+            with open(snapshot, "rb") as stream:
+                self.assertEqual(stream.read(), b"authenticated archive")
+            os.unlink(snapshot)
+            with self.assertRaisesRegex(RuntimeError, "SHA256 mismatch"):
+                fetch.snapshot_local_deb(source, digest, root)
+
     def test_local_deb_extracts_in_staging_and_rejects_traversal(self):
         with tempfile.TemporaryDirectory() as root:
             safe_deb = os.path.join(root, "safe.deb")
