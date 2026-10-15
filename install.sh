@@ -492,13 +492,13 @@ resolve_index() {  # $PACKAGES + $TMP/groups -> $STATS (P/S/M lines)
         d = verpartcmp(ae, be)
         return d ? d : verpartcmp(ar, br)
     }
-    function dep_ok(atom,   name, virtual, op, req, open, close, body, fields, actual, cmp) {
+    function dep_ok(atom,   name, virtual, op, req, open, closing, body, fields, actual, cmp) {
         atom = trim(atom); name = atom; op = ""; req = ""
         open = index(atom, "(")
         if (open) {
-            close = index(substr(atom, open + 1), ")")
-            if (!close) return 0
-            body = trim(substr(atom, open + 1, close - 1))
+            closing = index(substr(atom, open + 1), ")")
+            if (!closing) return 0
+            body = trim(substr(atom, open + 1, closing - 1))
             split(body, fields, /[ \t]+/)
             op = fields[1]; req = fields[2]
             if (op !~ /^(<<|<=|=|>=|>>)$/ || req == "") return 0
@@ -597,13 +597,12 @@ resolve_index() {  # $PACKAGES + $TMP/groups -> $STATS (P/S/M lines)
 
 load_stats() {
     tab=$(printf '\t')
-    MISSING_N=0
     for _g in $GROUPS; do eval "CNT_$_g=0; BY_$_g=0; KB_$_g=0"; done
     [ -s "${STATS:-}" ] || return 0
     while IFS="$tab" read -r _t _g _a _b _c _d; do
         case "$_t" in
             S) eval "CNT_$_g=$_a; BY_$_g=$_b; KB_$_g=$_c" ;;
-            M) MISSING_N=$((MISSING_N + 1)) ;;
+            M) : ;;
         esac
     done < "$STATS"
 }
@@ -1642,7 +1641,7 @@ main() {
             load_stats
             res ok "index resolved: $(grep -c '^P' "$STATS" 2>/dev/null || echo 0) packages, $(grep -c '^S' "$STATS") groups"
         else
-            res warn "dependency resolution failed — sizes unavailable"
+            die "dependency resolution failed for authenticated Debian metadata"
         fi
     else
         write_groups
@@ -1670,7 +1669,11 @@ main() {
     if [ -z "${PACKAGES:-}" ]; then
         inf "no package index yet — attempting download before the plan"
         fetch_index || true
-        if [ -n "${PACKAGES:-}" ]; then write_groups; resolve_index && load_stats; fi
+        if [ -n "${PACKAGES:-}" ]; then
+            write_groups
+            resolve_index || die "dependency resolution failed for authenticated Debian metadata"
+            load_stats
+        fi
     fi
     sel_stats
     build_list
