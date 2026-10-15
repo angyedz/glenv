@@ -113,6 +113,10 @@ installer stops before extracting Debian packages.
 transaction; rollback is refused if a managed file has changed since that
 transaction was applied.
 
+Local Debian packages must match a package, version, architecture, and SHA256
+entry in the current signed Debian index. The helper downloads that index and
+rejects files that do not match before dependency resolution or sysroot writes.
+
 ## Idempotency
 
 Every stage is safe to re-run: mounts are already mounts, files already

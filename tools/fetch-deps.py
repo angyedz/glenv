@@ -429,21 +429,147 @@ def _safe_extract_tar(archive, destination):
             else:
                 raise RuntimeError("unsupported special file in Debian package: " + name)
 
+def _ar_members(path):
+    members = []
+    string_table = b""
+    archive_size = os.path.getsize(path)
+    with open(path, "rb") as archive:
+        if archive.read(8) != b"!<arch>\n":
+            raise RuntimeError("not a Debian ar archive")
+        while True:
+            header = archive.read(60)
+            if not header:
+                break
+            if len(header) != 60 or header[58:60] != bytes((96, 10)):
+                raise RuntimeError("malformed Debian ar member header")
+            try:
+                size = int(header[48:58].decode("ascii").strip())
+                raw_name = header[:16].decode("ascii").strip()
+            except (UnicodeDecodeError, ValueError):
+                raise RuntimeError("invalid Debian ar member header")
+            data_offset = archive.tell()
+            if size < 0 or data_offset + size > archive_size:
+                raise RuntimeError("truncated Debian ar member")
+            if raw_name == "//":
+                string_table = archive.read(size)
+            elif raw_name in ("/", "/SYM64/"):
+                archive.seek(data_offset + size)
+            else:
+                member_size = size
+                if raw_name.startswith("#1/"):
+                    try:
+                        name_size = int(raw_name[3:])
+                    except ValueError:
+                        raise RuntimeError("invalid BSD ar member name")
+                    if name_size <= 0 or name_size > size:
+                        raise RuntimeError("invalid BSD ar member name length")
+                    name = archive.read(name_size).decode("utf-8", "strict").rstrip(chr(0))
+                    data_offset += name_size
+                    member_size -= name_size
+                elif raw_name.startswith("/") and raw_name[1:].isdigit():
+                    index = int(raw_name[1:])
+                    if index >= len(string_table):
+                        raise RuntimeError("invalid GNU ar string-table reference")
+                    end = string_table.find(b"/\n", index)
+                    if end < 0:
+                        raise RuntimeError("unterminated GNU ar string-table name")
+                    name = string_table[index:end].decode("utf-8", "strict")
+                else:
+                    name = raw_name.rstrip("/")
+                members.append({"name": name, "offset": data_offset, "size": member_size})
+                archive.seek(data_offset + member_size)
+            if size % 2:
+                archive.seek(archive.tell() + 1)
+    return members
+
+def _copy_ar_member(archive_path, member, destination):
+    remaining = member["size"]
+    with open(archive_path, "rb") as source, open(destination, "wb") as output:
+        source.seek(member["offset"])
+        while remaining:
+            block = source.read(min(1024 * 1024, remaining))
+            if not block:
+                raise RuntimeError("truncated Debian ar member: " + member["name"])
+            output.write(block)
+            remaining -= len(block)
+
+def _tar_bytes_for_member(deb_path, member, temp_dir):
+    path = os.path.join(temp_dir, "control-data")
+    _copy_ar_member(deb_path, member, path)
+    if not member["name"].endswith(".zst"):
+        return path
+    zstd = shutil.which("zstd")
+    if not zstd:
+        raise RuntimeError("zstd is required to read this Debian package")
+    tar_path = os.path.join(temp_dir, "control.tar")
+    with open(tar_path, "wb") as output:
+        subprocess.run([zstd, "-dc", path], check=True, stdout=output)
+    return tar_path
+
+def _deb_control_fields(deb_path):
+    members = _ar_members(deb_path)
+    controls = [member for member in members
+                if re.fullmatch(r"control\.tar(?:\.(?:xz|gz|bz2|lzma|zst))?", member["name"])]
+    if len(controls) != 1:
+        raise RuntimeError("expected exactly one supported control.tar member")
+    with tempfile.TemporaryDirectory(prefix="glenv-deb-control-") as tmp:
+        tar_path = _tar_bytes_for_member(deb_path, controls[0], tmp)
+        with tarfile.open(tar_path, "r:*") as tar:
+            control = next((member for member in tar
+                            if _safe_relative(member.name) == "control" and member.isfile()), None)
+            if control is None:
+                raise RuntimeError("Debian control archive has no regular control file")
+            stream = tar.extractfile(control)
+            if stream is None:
+                raise RuntimeError("cannot read Debian control file")
+            data = stream.read(1024 * 1024 + 1)
+            if len(data) > 1024 * 1024:
+                raise RuntimeError("Debian control file is too large")
+    fields = {}
+    current = None
+    for line in data.decode("utf-8", "strict").splitlines():
+        if line.startswith((" ", "\t")):
+            if current:
+                fields[current] += " " + line.strip()
+            continue
+        key, separator, value = line.partition(":")
+        if separator:
+            current = key
+            fields[key] = value.strip()
+    for required in ("Package", "Version", "Architecture"):
+        if not fields.get(required):
+            raise RuntimeError("Debian control file is missing " + required)
+    return fields
+
+def verify_local_deb(path, index):
+    try:
+        os.lstat(path)
+    except OSError as error:
+        raise RuntimeError("cannot inspect local .deb: " + str(error))
+    if not os.path.isfile(path) or os.path.islink(path):
+        raise RuntimeError("local .deb must be a regular file")
+    fields = _deb_control_fields(path)
+    if fields["Architecture"] not in (ARCH, "all"):
+        raise RuntimeError("local .deb architecture does not match " + ARCH)
+    pkg = index.get(fields["Package"])
+    if not pkg or pkg.get("Version") != fields["Version"] or \
+       pkg.get("Architecture") not in (ARCH, "all"):
+        raise RuntimeError("local .deb package/version is not present in the authenticated Debian index")
+    verify_sha256(path, pkg.get("SHA256", ""))
+    return pkg
+
 def extract(deb_path, destination):
-    members = subprocess.run(["ar", "t", deb_path], check=True, text=True,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.splitlines()
-    data_members = [name.strip() for name in members
-                    if re.fullmatch(r"data\.tar(?:\.(?:xz|gz|bz2|lzma|zst))?", name.strip())]
+    members = _ar_members(deb_path)
+    data_members = [member for member in members
+                    if re.fullmatch(r"data\.tar(?:\.(?:xz|gz|bz2|lzma|zst))?", member["name"])]
     if len(data_members) != 1:
         raise RuntimeError("expected exactly one supported data.tar member in " + deb_path)
     with tempfile.NamedTemporaryFile(prefix="glenv-data-", dir=os.path.dirname(destination),
                                      delete=False) as stream:
         data_path = stream.name
     try:
-        with open(data_path, "wb") as output:
-            subprocess.run(["ar", "p", deb_path, data_members[0]], check=True, stdout=output,
-                           stderr=subprocess.PIPE)
-        if data_members[0].endswith(".zst"):
+        _copy_ar_member(deb_path, data_members[0], data_path)
+        if data_members[0]["name"].endswith(".zst"):
             zstd = shutil.which("zstd")
             if not zstd:
                 raise RuntimeError("zstd is required to extract this Debian package")
@@ -722,6 +848,11 @@ def _history_entries():
 def main():
     args = sys.argv[1:]
     recover_pending_transactions()
+    if args and args[0] == "--update-index":
+        if len(args) != 1:
+            raise RuntimeError("usage: fetch-deps.py --update-index")
+        update_index()
+        return
     if args and args[0] in ("history", "--history"):
         for entry in _history_entries():
             state = "rolled back" if entry.get("rolled_back") else "active"
@@ -746,14 +877,35 @@ def main():
         _write_json(os.path.join(PREFIX, "history", entry["id"], "manifest.json"), entry)
         print("Rolled back transaction " + entry["id"])
         return
-    if args and args[0] in ("--update", "update"):
+    local_deb = None
+    local_pkg = None
+    index = provides = None
+    if args and args[0] == "--deb-file":
+        if len(args) != 2:
+            raise RuntimeError("usage: fetch-deps.py --deb-file path.deb")
+        local_deb = args[1]
         update_index()
-        args = args[1:]
-    roots = args
+        index, provides = parse_packages()
+        local_pkg = verify_local_deb(local_deb, index)
+        roots = [local_pkg["Package"]]
+    elif args and args[0] == "upgrade":
+        if len(args) != 1:
+            raise RuntimeError("usage: fetch-deps.py upgrade")
+        update_index()
+        roots = sorted({name for entry in _history_entries() if not entry.get("rolled_back")
+                        for name in entry.get("packages", [])})
+        if not roots:
+            raise RuntimeError("no active Debian package transactions to upgrade")
+    else:
+        if args and args[0] in ("--update", "update"):
+            update_index()
+            args = args[1:]
+        roots = args
     if not roots:
         print("usage: fetch-deps.py pkg...", file=sys.stderr)
         sys.exit(2)
-    index, provides = parse_packages()
+    if index is None:
+        index, provides = parse_packages()
     pkgs, missing = resolve([(name, None, None) for name in roots], index, provides)
     if missing:
         raise RuntimeError("dependency resolution failed; unavailable or incompatible: " +
@@ -773,7 +925,11 @@ def main():
         with tempfile.TemporaryDirectory(prefix="glenv-download-", dir=PREFIX) as download_dir:
             downloaded = []
             for number, pkg in enumerate(pkgs, 1):
-                path = _download_verified(pkg, download_dir)
+                if local_deb and pkg["Package"] == local_pkg["Package"]:
+                    path = local_deb
+                    verify_sha256(path, pkg.get("SHA256", ""))
+                else:
+                    path = _download_verified(pkg, download_dir)
                 extract(path, stage)
                 downloaded.append((pkg, path))
                 print(f"[{number}/{total}] verified and staged {pkg['Package']}")

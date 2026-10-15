@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Focused tests for the authenticated Debian package resolver and transactions."""
 import importlib.util
+import hashlib
 import io
 import os
 import tempfile
@@ -11,6 +12,35 @@ MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "tools", "fetch-deps
 SPEC = importlib.util.spec_from_file_location("glenv_fetch_deps", MODULE_PATH)
 fetch = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(fetch)
+
+
+def ar_member(name, payload):
+    header = (
+        name.ljust(16) + "0".ljust(12) + "0".ljust(6) + "0".ljust(6) +
+        "100644".ljust(8) + str(len(payload)).ljust(10)
+    ).encode("ascii") + bytes((96, 10))
+    return header + payload + (b"\n" if len(payload) % 2 else b"")
+
+
+def make_local_deb(path, control, files=()):
+    tar_buffer = io.BytesIO()
+    with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
+        data = control.encode("utf-8")
+        member = tarfile.TarInfo("control")
+        member.size = len(data)
+        tar.addfile(member, io.BytesIO(data))
+    data_buffer = io.BytesIO()
+    with tarfile.open(fileobj=data_buffer, mode="w") as tar:
+        for name, contents in files:
+            member = tarfile.TarInfo(name)
+            member.size = len(contents)
+            tar.addfile(member, io.BytesIO(contents))
+    archive = b"!<arch>\n"
+    archive += ar_member("debian-binary/", b"2.0\n")
+    archive += ar_member("control.tar/", tar_buffer.getvalue())
+    archive += ar_member("data.tar/", data_buffer.getvalue())
+    with open(path, "wb") as stream:
+        stream.write(archive)
 
 
 class ResolverTests(unittest.TestCase):
@@ -48,6 +78,60 @@ class ResolverTests(unittest.TestCase):
 
 
 class ExtractionAndRollbackTests(unittest.TestCase):
+    def test_local_deb_requires_exact_authenticated_package(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "sample.deb")
+            make_local_deb(
+                path,
+                "Package: sample\nVersion: 1.2-3\nArchitecture: amd64\nDepends: libc6 (>= 2.34)\n",
+            )
+            with open(path, "rb") as stream:
+                digest = hashlib.sha256(stream.read()).hexdigest()
+            index = {
+                "sample": {
+                    "Package": "sample",
+                    "Version": "1.2-3",
+                    "Architecture": "amd64",
+                    "SHA256": digest,
+                }
+            }
+            previous_arch = fetch.ARCH
+            try:
+                fetch.ARCH = "amd64"
+                self.assertEqual(fetch.verify_local_deb(path, index)["Package"], "sample")
+                index["sample"]["SHA256"] = "0" * 64
+                with self.assertRaisesRegex(RuntimeError, "SHA256 mismatch"):
+                    fetch.verify_local_deb(path, index)
+                index["sample"]["SHA256"] = digest
+                index["sample"]["Version"] = "1.2-4"
+                with self.assertRaisesRegex(RuntimeError, "authenticated Debian index"):
+                    fetch.verify_local_deb(path, index)
+            finally:
+                fetch.ARCH = previous_arch
+
+    def test_local_deb_extracts_in_staging_and_rejects_traversal(self):
+        with tempfile.TemporaryDirectory() as root:
+            safe_deb = os.path.join(root, "safe.deb")
+            make_local_deb(
+                safe_deb,
+                "Package: sample\nVersion: 1\nArchitecture: amd64\n",
+                [("usr/bin/sample", b"safe payload")],
+            )
+            stage = os.path.join(root, "stage")
+            fetch.extract(safe_deb, stage)
+            with open(os.path.join(stage, "usr", "bin", "sample"), "rb") as stream:
+                self.assertEqual(stream.read(), b"safe payload")
+
+            unsafe_deb = os.path.join(root, "unsafe.deb")
+            make_local_deb(
+                unsafe_deb,
+                "Package: sample\nVersion: 1\nArchitecture: amd64\n",
+                [("../escaped", b"no")],
+            )
+            with self.assertRaisesRegex(RuntimeError, "unsafe path"):
+                fetch.extract(unsafe_deb, os.path.join(root, "unsafe-stage"))
+            self.assertFalse(os.path.exists(os.path.join(root, "escaped")))
+
     def test_tar_path_traversal_is_rejected(self):
         with tempfile.TemporaryDirectory() as root:
             archive = os.path.join(root, "payload.tar")

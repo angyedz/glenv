@@ -206,6 +206,11 @@ before applying the staged files. The helper keeps a transaction history:
 `tools/fetch-deps.py history` lists updates and
 `tools/fetch-deps.py rollback [transaction-id]` restores the latest active
 transaction. Run `tools/integrate-system.sh` after an update to refresh `ld.so.cache`.
+For an externally supplied `.deb`, use
+`tools/fetch-deps.py --deb-file ./package.deb`; it is accepted only when its
+package name, version, architecture, and SHA256 exactly match the current
+authenticated Debian index. `tools/fetch-deps.py upgrade` refreshes the signed
+index and reinstalls the packages in active transaction history.
 
 ## Repository structure
 
