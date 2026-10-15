@@ -257,7 +257,8 @@ usage: sh install.sh [options]
   (no TTY on stdin)      type a line instead of the menu:
                          1|min, 2|std, 3|full, or group names: core,gl,net
 
-every downloaded .deb is verified against the SHA256 from the Debian index
+Debian InRelease signatures, index freshness, package-index hashes, and every
+downloaded .deb SHA256 are verified before extraction
 
 environment:
   GLENV_PREFIX=$PREFIX
@@ -271,52 +272,147 @@ EOF
 }
 
 # ------------------------------------------------------------ preflight -----
-fetch_index() {   # -> $PACKAGES (uncompressed) ; non-fatal on failure
-    local url out age fsize
-    url="$MIRROR/dists/$DIST/main/binary-$ARCH/Packages.xz"
-    PACKAGES=""
-    for f in "$PREFIX/debs/Packages" "$TREE/debs/Packages"; do
-        [ -s "$f" ] || continue
-        _mtime=$(file_mtime "$f")
-        [ "$_mtime" -gt 0 ] || continue
-        age=$(( ($(date +%s) - _mtime) / 60 ))
-        if [ "$age" -le 1440 ]; then PACKAGES=$f; inf "index: cached ($(file_size "$f") bytes, ${age}m old)"; break; fi
+debian_keyring() {
+    for _keyring in /usr/share/keyrings/debian-archive-keyring.pgp \
+                    /usr/share/keyrings/debian-archive-keyring.gpg; do
+        [ -s "$_keyring" ] && { printf '%s\n' "$_keyring"; return 0; }
     done
-    [ -n "$PACKAGES" ] && return 0
+    return 1
+}
 
-    out="$TMP/Packages.xz"
-    inf "index: $url"
-    wget -q -T 60 -O "$out" "$url" 2>/dev/null &
-    _wp=$!
-    _t0=$(now_cs); _pb=0; _sp=0; _lsize=-1; _lgrow=$_t0
-    while kill -0 "$_wp" 2>/dev/null; do
-        _b=$(file_size "$out")
-        _tn=$(now_cs); _dt=$((_tn - _t0))
-        if [ "$_dt" -ge 1 ] && [ "$_b" -gt "$_pb" ]; then
-            _sp=$((((_b - _pb)) * 100 / _dt)); _t0=$_tn; _pb=$_b
+debian_date_epoch() {   # Parse Debian's RFC 2822 UTC dates using BusyBox or GNU date.
+    _dde_iso=$(printf '%s\n' "$1" | awk '
+        BEGIN {
+            month["Jan"]="01"; month["Feb"]="02"; month["Mar"]="03"; month["Apr"]="04"
+            month["May"]="05"; month["Jun"]="06"; month["Jul"]="07"; month["Aug"]="08"
+            month["Sep"]="09"; month["Oct"]="10"; month["Nov"]="11"; month["Dec"]="12"
+        }
+        NF != 6 || $1 !~ /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun),$/ ||
+        $2 !~ /^[0-9][0-9]?$/ || !($3 in month) ||
+        $4 !~ /^[0-9][0-9][0-9][0-9]$/ ||
+        $5 !~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/ ||
+        ($6 != "UTC" && $6 != "+0000") { exit 1 }
+        { printf "%04d-%s-%02d %s\n", $4, month[$3], $2, $5 }
+    ') || return 1
+    [ -n "$_dde_iso" ] || return 1
+    date -u -d "$_dde_iso" +%s 2>/dev/null
+}
+
+verify_index_bundle() {   # $1=InRelease $2=Packages.xz $3=verified Release output
+    _inrelease=$1; _packages_xz=$2; _release=$3
+    _keyring=$(debian_keyring) || { INDEX_ERROR="Debian archive keyring is missing"; return 1; }
+    command -v gpgv >/dev/null 2>&1 || { INDEX_ERROR="gpgv is missing"; return 1; }
+    command -v sha256sum >/dev/null 2>&1 || { INDEX_ERROR="sha256sum is missing"; return 1; }
+    command -v unxz >/dev/null 2>&1 || { INDEX_ERROR="unxz is missing"; return 1; }
+    gpgv --keyring "$_keyring" --output "$_release" "$_inrelease" >/dev/null 2>&1 \
+        || { INDEX_ERROR="Debian InRelease signature is invalid"; return 1; }
+
+    _codename=$(awk -F': ' '$1 == "Codename" { print $2; exit }' "$_release")
+    [ "$_codename" = "$DIST" ] || { INDEX_ERROR="signed index codename mismatch"; return 1; }
+    _archs=$(awk -F': ' '$1 == "Architectures" { print " " $2 " "; exit }' "$_release")
+    case "$_archs" in *" $ARCH "*) ;; *) INDEX_ERROR="signed index does not include $ARCH"; return 1 ;; esac
+    _components=$(awk -F': ' '$1 == "Components" { print " " $2 " "; exit }' "$_release")
+    case "$_components" in *" main "*) ;; *) INDEX_ERROR="signed index does not include main"; return 1 ;; esac
+
+    _release_date=$(awk -F': ' '$1 == "Date" { print $2; exit }' "$_release")
+    [ -n "$_release_date" ] || { INDEX_ERROR="signed index has no Date"; return 1; }
+    _release_epoch=$(debian_date_epoch "$_release_date") || { INDEX_ERROR="cannot parse Debian Date"; return 1; }
+    _now=$(date -u +%s 2>/dev/null) || { INDEX_ERROR="cannot read system time"; return 1; }
+    case "$_release_epoch:$_now" in *[!0-9:]*) INDEX_ERROR="invalid Debian Date timestamp"; return 1 ;; esac
+    [ "$_release_epoch" -le $((_now + 600)) ] || { INDEX_ERROR="signed Debian index Date is in the future"; return 1; }
+    _valid_until=$(awk -F': ' '$1 == "Valid-Until" { print $2; exit }' "$_release")
+    if [ -n "$_valid_until" ]; then
+        _expiry=$(debian_date_epoch "$_valid_until") || { INDEX_ERROR="cannot parse Debian Valid-Until"; return 1; }
+        case "$_expiry" in ''|*[!0-9]*) INDEX_ERROR="invalid Debian Valid-Until timestamp"; return 1 ;; esac
+        [ "$_expiry" -gt "$_now" ] || { INDEX_ERROR="signed Debian index has expired"; return 1; }
+    fi
+
+    # Debian stable releases may omit Valid-Until. Preserve the latest signed
+    # Release date we've accepted so a mirror cannot roll the local index back.
+    if [ -s "$PREFIX/debs/InRelease" ] && [ "$_inrelease" != "$PREFIX/debs/InRelease" ]; then
+        _cached_release="$TMP/Previous-Release"
+        if gpgv --keyring "$_keyring" --output "$_cached_release" "$PREFIX/debs/InRelease" >/dev/null 2>&1; then
+            _cached_date=$(awk -F': ' '$1 == "Date" { print $2; exit }' "$_cached_release")
+            _cached_epoch=$(debian_date_epoch "$_cached_date") || _cached_epoch=""
+            case "$_cached_epoch" in ''|*[!0-9]*) ;; *)
+                [ "$_release_epoch" -ge "$_cached_epoch" ] \
+                    || { INDEX_ERROR="signed Debian index is older than the previously accepted index"; return 1; } ;;
+            esac
         fi
-        if [ "$_b" -gt "$_lsize" ]; then
-            _lsize=$_b; _lgrow=$_tn
-        elif [ $((_tn - _lgrow)) -gt 4500 ]; then
-            kill "$_wp" 2>/dev/null; break
-        fi
-        printf '\r        %sPackages.xz%s  %s  %s   \033[K' "$G_ARR" "$C_OFF" "$(hsize "$_b")" "$([ "$_sp" -gt 0 ] 2>/dev/null && fmt_speed "$_sp" || printf -- '--')"
-        sleep 0.25
-    done
-    wait "$_wp" 2>/dev/null || true
-    _b=$(file_size "$out")
-    if [ "$_b" -lt 100000 ]; then
-        printf '\r\033[K'
-        res warn "index download failed (need network + CA certificates)"
+    fi
+
+    _expected=$(awk -v path="main/binary-$ARCH/Packages.xz" '
+        /^SHA256:/ { in_sha = 1; next }
+        /^[^ ]/ { if (in_sha) exit; next }
+        in_sha && $3 == path { print $1 " " $2; exit }
+    ' "$_release")
+    set -- $_expected
+    _sha=$1; _size=$2
+    case "$_sha" in
+        ''|*[!0-9a-fA-F]*) INDEX_ERROR="signed index has no SHA256 for Packages.xz"; return 1 ;;
+    esac
+    [ "${#_sha}" -eq 64 ] || { INDEX_ERROR="signed index has malformed Packages.xz SHA256"; return 1; }
+    case "$_size" in ''|*[!0-9]*) INDEX_ERROR="signed index has malformed Packages.xz size"; return 1 ;; esac
+    [ "$(file_size "$_packages_xz")" = "$_size" ] \
+        || { INDEX_ERROR="Packages.xz size does not match signed index"; return 1; }
+    [ "$(sha256sum "$_packages_xz" 2>/dev/null | awk '{print $1}')" = "$_sha" ] \
+        || { INDEX_ERROR="Packages.xz SHA256 does not match signed index"; return 1; }
+    return 0
+}
+
+load_cached_index() {
+    _cache="$PREFIX/debs"
+    [ -s "$_cache/InRelease" ] && [ -s "$_cache/Packages.xz" ] || return 1
+    _mtime=$(file_mtime "$_cache/InRelease")
+    [ "$_mtime" -gt 0 ] || return 1
+    _age=$(( ($(date +%s) - _mtime) / 60 ))
+    [ "$_age" -le 1440 ] || return 1
+    INDEX_ERROR=""
+    if ! verify_index_bundle "$_cache/InRelease" "$_cache/Packages.xz" "$TMP/Release"; then
+        res warn "cached Debian index rejected: $INDEX_ERROR"
         return 1
     fi
-    if unxz -c "$out" > "$TMP/Packages" 2>/dev/null; then
-        printf '\r        %sPackages.xz%s  %s  %s\n\033[K' "$G_ARR" "$C_OFF" "$(hsize "$_b")" "ok"
-        PACKAGES=$TMP/Packages
-        return 0
+    unxz -c "$_cache/Packages.xz" > "$TMP/Packages" 2>/dev/null || return 1
+    INDEX_INRELEASE="$_cache/InRelease"
+    INDEX_PACKAGES_XZ="$_cache/Packages.xz"
+    PACKAGES="$TMP/Packages"
+    inf "index: cached and signature verified (${_age}m old)"
+    return 0
+}
+
+fetch_index() {   # -> $PACKAGES (uncompressed); only accepts signed, fresh metadata
+    local base inrelease packages_xz
+    PACKAGES=""
+    INDEX_ERROR=""
+    if ! command -v gpgv >/dev/null 2>&1 || ! debian_keyring >/dev/null 2>&1 || \
+       ! command -v sha256sum >/dev/null 2>&1 || ! command -v unxz >/dev/null 2>&1; then
+        INDEX_ERROR="signature verification prerequisites are not installed"
+        return 1
     fi
-    printf '\r\033[K'
-    res warn "index decompression failed"
+    base="$MIRROR/dists/$DIST"
+    inrelease="$TMP/InRelease"
+    packages_xz="$TMP/Packages.xz"
+    if wget -q -T 60 -O "$inrelease" "$base/InRelease" 2>/dev/null && [ -s "$inrelease" ]; then
+        if wget -q -T 60 -O "$packages_xz" "$base/main/binary-$ARCH/Packages.xz" 2>/dev/null && [ -s "$packages_xz" ]; then
+            if verify_index_bundle "$inrelease" "$packages_xz" "$TMP/Release"; then
+                unxz -c "$packages_xz" > "$TMP/Packages" 2>/dev/null || {
+                    INDEX_ERROR="verified Packages.xz could not be decompressed"; return 1;
+                }
+                INDEX_INRELEASE="$inrelease"
+                INDEX_PACKAGES_XZ="$packages_xz"
+                PACKAGES="$TMP/Packages"
+                res ok "Debian InRelease signature, freshness, index hash, and $ARCH codename verified"
+                return 0
+            fi
+        else
+            INDEX_ERROR="could not download Packages.xz"
+        fi
+    else
+        INDEX_ERROR="could not download Debian InRelease"
+    fi
+    res warn "fresh Debian index unavailable: $INDEX_ERROR"
+    load_cached_index && return 0
+    PACKAGES=""
     return 1
 }
 
@@ -331,30 +427,118 @@ resolve_index() {  # $PACKAGES + $TMP/groups -> $STATS (P/S/M lines)
     STATS="$TMP/stats"
     awk -v SEL="$TMP/groups" -v DEBARCH="$ARCH" '
     function trim(s) { gsub(/^[ \t\r]+|[ \t\r]+$/, "", s); return s }
-    function stripver(s) { gsub(/\([^)]*\)/, "", s); return trim(s) }
-    function flush(   i, n, a, p) {
+    function stripver(s) { gsub(/\([^)]*\)/, "", s); sub(/:[a-z0-9-]+$/, "", s); return trim(s) }
+    function flush(   i, n, a, p, pver) {
         if (cur == "") return
         if ((arch == DEBARCH || arch == "all") && !(cur in V)) {
             V[cur] = 1
-            F[cur] = file; SZ[cur] = size + 0; ISZ[cur] = isize + 0; DEP[cur] = deps; SH[cur] = shasum
+            F[cur] = file; SZ[cur] = size + 0; ISZ[cur] = isize + 0; DEP[cur] = deps; SH[cur] = shasum; VER[cur] = ver
             n = split(prov, a, ",")
-            for (i = 1; i <= n; i++) { p = stripver(a[i]); if (p != "" && !(p in PF)) PF[p] = cur }
+            for (i = 1; i <= n; i++) {
+                p = trim(a[i]); pver = ""
+                if (match(p, /\([^)]*\)/)) {
+                    pver = substr(p, RSTART + 1, RLENGTH - 2)
+                    gsub(/^[ \t]*=[ \t]*/, "", pver)
+                }
+                p = stripver(p)
+                if (p != "" && !(p in PF)) { PF[p] = cur; PV[p] = pver }
+            }
         }
         cur = ""; file = ""; size = ""; isize = ""; deps = ""; prov = ""; arch = ""; ver = ""; shasum = ""
     }
+    function char_order(c,   i) {
+        if (c == "~") return -1
+        if (c == "") return 0
+        for (i = 1; i <= 127; i++) if (sprintf("%c", i) == c) return i
+        return 255
+    }
+    function verpartcmp(a, b,   i, j, ca, cb, ai, bj, an, bn, oa, ob) {
+        i = 1; j = 1
+        while (i <= length(a) || j <= length(b)) {
+            while ((i <= length(a) && substr(a, i, 1) !~ /^[0-9]$/) ||
+                   (j <= length(b) && substr(b, j, 1) !~ /^[0-9]$/)) {
+                ca = (i <= length(a) && substr(a, i, 1) !~ /^[0-9]$/) ? substr(a, i, 1) : ""
+                cb = (j <= length(b) && substr(b, j, 1) !~ /^[0-9]$/) ? substr(b, j, 1) : ""
+                oa = (ca ~ /^[A-Za-z]$/) ? char_order(ca) : ((ca == "") ? 0 : char_order(ca) + 256)
+                ob = (cb ~ /^[A-Za-z]$/) ? char_order(cb) : ((cb == "") ? 0 : char_order(cb) + 256)
+                if (oa != ob) return (oa < ob) ? -1 : 1
+                if (ca != "") i++
+                if (cb != "") j++
+            }
+            while (substr(a, i, 1) == "0") i++
+            while (substr(b, j, 1) == "0") j++
+            ai = i; bj = j
+            while (substr(a, i, 1) ~ /^[0-9]$/ && i <= length(a)) i++
+            while (substr(b, j, 1) ~ /^[0-9]$/ && j <= length(b)) j++
+            an = i - ai; bn = j - bj
+            if (an != bn) return (an < bn) ? -1 : 1
+            ca = substr(a, ai, an); cb = substr(b, bj, bn)
+            if (ca != cb) return (ca < cb) ? -1 : 1
+        }
+        return 0
+    }
+    function debcmp(a, b,   ae, be, p, q, ar, br, i, d) {
+        p = index(a, ":"); q = index(b, ":")
+        ae = (p ? substr(a, 1, p - 1) : "0"); ar = (p ? substr(a, p + 1) : a)
+        be = (q ? substr(b, 1, q - 1) : "0"); br = (q ? substr(b, q + 1) : b)
+        if (ae + 0 != be + 0) return (ae + 0 < be + 0) ? -1 : 1
+        p = 0; q = 0
+        for (i = length(ar); i > 0; i--) if (substr(ar, i, 1) == "-") { p = i; break }
+        for (i = length(br); i > 0; i--) if (substr(br, i, 1) == "-") { q = i; break }
+        if (p) { ae = substr(ar, 1, p - 1); ar = substr(ar, p + 1) }
+        else { ae = ar; ar = "0" }
+        if (q) { be = substr(br, 1, q - 1); br = substr(br, q + 1) }
+        else { be = br; br = "0" }
+        d = verpartcmp(ae, be)
+        return d ? d : verpartcmp(ar, br)
+    }
+    function dep_ok(atom,   name, virtual, op, req, open, closing, body, fields, actual, cmp) {
+        atom = trim(atom); name = atom; op = ""; req = ""
+        open = index(atom, "(")
+        if (open) {
+            closing = index(substr(atom, open + 1), ")")
+            if (!closing) return 0
+            body = trim(substr(atom, open + 1, closing - 1))
+            split(body, fields, /[ \t]+/)
+            op = fields[1]; req = fields[2]
+            if (op !~ /^(<<|<=|=|>=|>>)$/ || req == "") return 0
+            name = trim(substr(atom, 1, open - 1))
+        }
+        sub(/:.*/, "", name)
+        if (name in V) actual = VER[name]
+        else if (name in PF) {
+            virtual = name
+            name = PF[virtual]
+            actual = PV[virtual]
+            if (op != "" && actual == "") return 0
+            if (actual == "") actual = VER[name]
+        } else return 0
+        if (op == "") return 1
+        cmp = debcmp(actual, req)
+        if (op == "<<") return cmp < 0
+        if (op == "<=") return cmp <= 0
+        if (op == "=") return cmp == 0
+        if (op == ">=") return cmp >= 0
+        return cmp > 0
+    }
     FILENAME != SEL {
         if ($0 == "") { flush(); next }
-        if ($0 ~ /^[ \t]/) next
+        if ($0 ~ /^[ \t]/) {
+            if (lastkey == "Depends" || lastkey == "Pre-Depends") deps = deps " " trim($0)
+            else if (lastkey == "Provides") prov = prov " " trim($0)
+            next
+        }
         pos = index($0, ":")
         if (pos == 0) next
         key = substr($0, 1, pos - 1); val = substr($0, pos + 2)
+        lastkey = key
         if (key == "Package") { if (cur != "") flush(); cur = val }
         else if (key == "Version") ver = val
         else if (key == "Filename") file = val
         else if (key == "Size") size = val
         else if (key == "Installed-Size") isize = val
-        else if (key == "Depends") deps = val
-        else if (key == "Pre-Depends") deps = deps ", " val
+        else if (key == "Depends") deps = (deps == "" ? val : deps ", " val)
+        else if (key == "Pre-Depends") deps = (deps == "" ? val : deps ", " val)
         else if (key == "SHA256") shasum = val
         else if (key == "Provides") prov = val
         else if (key == "Architecture") arch = val
@@ -373,6 +557,8 @@ resolve_index() {  # $PACKAGES + $TMP/groups -> $STATS (P/S/M lines)
         for (gi = 1; gi <= gcnt; gi++) {
             g = GN[gi]
             for (k in Q) delete Q[k]
+            for (k in seen) delete seen[k]
+            for (k in missing) delete missing[k]
             hd = 0; ql = 0
             n = split(GP[g], a, " ")
             for (i = 1; i <= n; i++) if (a[i] != "") qadd(a[i])
@@ -390,17 +576,20 @@ resolve_index() {  # $PACKAGES + $TMP/groups -> $STATS (P/S/M lines)
                 if (d == "") continue
                 ng = split(d, grps, ",")
                 for (i = 1; i <= ng; i++) {
+                    if (trim(grps[i]) == "") continue
                     na = split(grps[i], alts, "|")
+                    chosen = 0
                     for (j = 1; j <= na; j++) {
-                        alt = stripver(alts[j])
+                        alt = trim(alts[j])
                         if (alt == "") continue
-                        if ((alt in seen) || (alt in V) || (alt in PF)) { qadd(alt); break }
+                        if (dep_ok(alt)) { alt = stripver(alt); qadd(alt); chosen = 1; break }
                     }
+                    if (!chosen) missing[trim(grps[i])] = 1
                 }
             }
+            for (m in missing) printf "M\t%s\t%s\n", g, m
             printf "S\t%s\t%d\t%d\t%d\n", g, cnt, bytes, disk
         }
-        for (m in missing) printf "M\t%s\n", m
     }
     ' "$PACKAGES" "$TMP/groups" > "$STATS" 2>"$TMP/awk.err"
     [ -s "$STATS" ] || { [ -s "$TMP/awk.err" ] && cat "$TMP/awk.err"; return 1; }
@@ -409,15 +598,32 @@ resolve_index() {  # $PACKAGES + $TMP/groups -> $STATS (P/S/M lines)
 
 load_stats() {
     tab=$(printf '\t')
-    MISSING_N=0
     for _g in $GROUPS; do eval "CNT_$_g=0; BY_$_g=0; KB_$_g=0"; done
     [ -s "${STATS:-}" ] || return 0
     while IFS="$tab" read -r _t _g _a _b _c _d; do
         case "$_t" in
             S) eval "CNT_$_g=$_a; BY_$_g=$_b; KB_$_g=$_c" ;;
-            M) MISSING_N=$((MISSING_N + 1)) ;;
+            M) : ;;
         esac
     done < "$STATS"
+}
+
+check_selected_dependencies() {
+    [ -s "${STATS:-}" ] || return 0
+    tab=$(printf '\t')
+    : > "$TMP/selected-missing"
+    while IFS="$tab" read -r _type _group _name _rest; do
+        [ "$_type" = M ] || continue
+        if sel_has "$_group"; then
+            printf '%s: %s\n' "$_group" "$_name" >> "$TMP/selected-missing"
+        fi
+    done < "$STATS"
+    if [ -s "$TMP/selected-missing" ]; then
+        res warn "selected packages have unresolved dependencies:"
+        sed 's/^/          /' "$TMP/selected-missing"
+        return 1
+    fi
+    return 0
 }
 
 build_list() {   # selected groups -> $LIST (name, file, size, kb, sha256)
@@ -550,7 +756,7 @@ plan_screen() {
     apk_need
     pl "Alpine packages (apk)" " ${APK_NEED:-nothing}"
     if [ -n "${PACKAGES:-}" ]; then
-        pl "Debian packages" " $SEL_CNT · $(hsize "$SEL_BYTES") download · $(hkb "$SEL_KB") on disk"
+        pl "Debian packages (signed index)" " $SEL_CNT · $(hsize "$SEL_BYTES") download · $(hkb "$SEL_KB") on disk"
         for _g in $GROUPS; do
             sel_has "$_g" || continue
             eval "_c=\$CNT_$_g; _b=\$BY_$_g; _k=\$KB_$_g"
@@ -564,7 +770,6 @@ plan_screen() {
     pl "Disk required" " $(hkb "$SEL_KB") (+ $(hsize "${DL_TOTAL:-0}") packages cache)"
     pl "Prefix" " $PREFIX ($([ -d "$SYSROOT" ] && printf upgrade || printf fresh))"
     if [ "$FREE_KB" -gt 0 ]; then pl "Free space" " $(hsize "$((FREE_KB * 1024))")"; else pl "Free space" " unknown"; fi
-    [ "${MISSING_N:-0}" -gt 0 ] && printf '        %sUnresolvable dependencies%s     %d (usually virtual packages — harmless)\n' "$C_YEL" "$C_OFF" "$MISSING_N"
     printf '\n        %sSystem changes (need root):%s\n' "$C_DIM" "$C_OFF"
     printf '          + %s        real glibc loader (gcompat kept as *.gcompat-shim)\n' "$LOADER_HOST"
     [ -n "$LOADER_ALIAS_HOST" ] && printf '          + %s      symlink (Debian binaries use this PT_INTERP)\n' "$LOADER_ALIAS_HOST"
@@ -582,6 +787,9 @@ apk_need() {
     APK_NEED=""
     apk info -e bubblewrap >/dev/null 2>&1 || APK_NEED="bubblewrap"
     command -v sha256sum >/dev/null 2>&1 || APK_NEED="$APK_NEED coreutils"
+    command -v gpgv >/dev/null 2>&1 || APK_NEED="$APK_NEED gpgv"
+    debian_keyring >/dev/null 2>&1 || APK_NEED="$APK_NEED debian-archive-keyring"
+    command -v zstd >/dev/null 2>&1 || APK_NEED="$APK_NEED zstd"
     if [ ! -f /etc/ssl/certs/ca-certificates.crt ]; then
         APK_NEED="$APK_NEED ca-certificates"
     fi
@@ -747,6 +955,7 @@ extract_deb() {   # $1 = .deb, $2 = sysroot ; returns 0 ok
                 case "$_mname" in
                     *.xz|*.lzma) unxz -c "$_data" | tar -x -C "$_out" ;;
                     *.gz|*.gzip) gzip -dc "$_data" | tar -x -C "$_out" ;;
+                    *.zst)       zstd -dc "$_data" | tar -x -C "$_out" ;;
                     data.tar)    tar -xf "$_data" -C "$_out" ;;
                     *) set +o pipefail; rm -f "$TMP/member.bin" "$TMP/data.bin"; return 2 ;;
                 esac
@@ -1411,7 +1620,10 @@ main() {
     command -v wget  >/dev/null 2>&1 && res ok "wget (busybox)" || die "need wget"
     command -v awk   >/dev/null 2>&1 && res ok "awk" || die "need awk"
     command -v tar   >/dev/null 2>&1 && res ok "tar" || die "need tar"
-    command -v sha256sum >/dev/null 2>&1 && res ok "sha256sum (busybox)" || res warn "sha256sum missing — package hashes will not be verified"
+    command -v sha256sum >/dev/null 2>&1 && res ok "sha256sum" || res warn "sha256sum missing — coreutils will be included in the confirmed prerequisites"
+    command -v gpgv >/dev/null 2>&1 && debian_keyring >/dev/null 2>&1 \
+        && res ok "Debian archive signature verifier and keyring" \
+        || res warn "Debian signature verifier/keyring missing — signed index will be fetched after prerequisite approval"
     command -v unxz  >/dev/null 2>&1 || die "need unxz (install Alpine package xz)"
     command -v gzip  >/dev/null 2>&1 || die "need gzip (BusyBox gzip is sufficient)"
     command -v mount >/dev/null 2>&1 && command -v umount >/dev/null 2>&1 || die "need mount and umount utilities"
@@ -1432,12 +1644,11 @@ main() {
             load_stats
             res ok "index resolved: $(grep -c '^P' "$STATS" 2>/dev/null || echo 0) packages, $(grep -c '^S' "$STATS") groups"
         else
-            res warn "dependency resolution failed — sizes unavailable"
+            die "dependency resolution failed for authenticated Debian metadata"
         fi
     else
         write_groups
     fi
-    [ "${MISSING_N:-0}" -gt 0 ] && inf "$MISSING_N unresolvable dependencies (virtual packages)"
 
     # ---- 2. components
     stage "Components"
@@ -1461,10 +1672,15 @@ main() {
     if [ -z "${PACKAGES:-}" ]; then
         inf "no package index yet — attempting download before the plan"
         fetch_index || true
-        if [ -n "${PACKAGES:-}" ]; then write_groups; resolve_index && load_stats; fi
+        if [ -n "${PACKAGES:-}" ]; then
+            write_groups
+            resolve_index || die "dependency resolution failed for authenticated Debian metadata"
+            load_stats
+        fi
     fi
     sel_stats
     build_list
+    check_selected_dependencies || die "dependency resolution failed for selected packages"
 
     # ---- 3. plan
     stage "Plan"
@@ -1479,26 +1695,51 @@ main() {
     stage "Privileges"
     setup_sudo
     [ -n "$SUDO" ] && res ok "root access granted ($SUDO)" || res ok "running as root"
-    if [ ! -d "$PREFIX" ]; then
-        as_root mkdir -p "$PREFIX" && as_root chown "$(id -un)" "$PREFIX"
-    fi
-    mkdir -p "$DEBS" "$SYSROOT" "$PREFIX/bin" "$PREFIX/lib"
-    printf '%s\n' 'glenv managed prefix' > "$PREFIX/.glenv-prefix"
     apk_need
     if [ -n "$APK_NEED" ]; then
         inf "apk add $APK_NEED"
         if as_root apk add --no-cache $APK_NEED >/dev/null 2>&1; then
             res ok "apk packages installed: $APK_NEED"
         else
-            res warn "apk add failed (offline?) — some features may be missing"
+            apk_need
+            if ! command -v gpgv >/dev/null 2>&1 || ! debian_keyring >/dev/null 2>&1 || \
+               ! command -v sha256sum >/dev/null 2>&1; then
+                die "cannot install the Debian signature verifier, keyring, and SHA256 tool; refusing unsigned package metadata"
+            fi
+            res warn "apk add failed (offline?) — continuing because required verification tools are available"
         fi
     else
         res same "apk: nothing to install"
     fi
-    # keep the index inside the prefix for later runs
-    if [ -n "${PACKAGES:-}" ] && [ "$PACKAGES" != "$DEBS/Packages" ] && [ -f "$PACKAGES" ]; then
-        cp "$PACKAGES" "$DEBS/Packages" 2>/dev/null && PACKAGES="$DEBS/Packages"
+    if [ -z "${PACKAGES:-}" ]; then
+        fetch_index || die "cannot obtain authenticated Debian package metadata: ${INDEX_ERROR:-verification failed}"
+        write_groups
+        resolve_index || die "dependency resolution failed for authenticated Debian metadata"
+        load_stats
+        check_selected_dependencies || die "dependency resolution failed for selected packages"
+        sel_stats
+        build_list
+        stage "Verified plan"
+        plan_screen
+        if ! confirm; then
+            printf '  %scancelled — prerequisite packages may have been installed; glenv changes were not applied%s\n\n' "$C_YEL" "$C_OFF"
+            exit 0
+        fi
+        res ok "verified package plan confirmed"
     fi
+    if [ ! -d "$PREFIX" ]; then
+        as_root mkdir -p "$PREFIX" && as_root chown "$(id -un)" "$PREFIX"
+    fi
+    mkdir -p "$DEBS" "$SYSROOT" "$PREFIX/bin" "$PREFIX/lib"
+    printf '%s\n' 'glenv managed prefix' > "$PREFIX/.glenv-prefix"
+    # Persist only the authenticated bundle so cached indices are re-verified on every run.
+    [ -n "${INDEX_INRELEASE:-}" ] && cp "$INDEX_INRELEASE" "$DEBS/InRelease" \
+        || die "verified Debian InRelease is unavailable"
+    [ -n "${INDEX_PACKAGES_XZ:-}" ] && cp "$INDEX_PACKAGES_XZ" "$DEBS/Packages.xz" \
+        || die "verified Debian Packages.xz is unavailable"
+    [ -n "${PACKAGES:-}" ] && cp "$PACKAGES" "$DEBS/Packages" \
+        || die "verified Debian Packages index is unavailable"
+    PACKAGES="$DEBS/Packages"
 
     # ---- 5. packages
     stage "Packages"

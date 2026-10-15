@@ -24,8 +24,11 @@ installer writes fstab entries but you must arrange to mount them at boot.
 
 One self-contained file (POSIX sh / BusyBox ash — no Python or Go required to
 install), a component menu, a plan screen before any `sudo`, and byte-accurate
-progress bars. The full preset downloads ~147 MB of Debian packages; every
-`.deb` is verified against the SHA256 from the Debian package index.
+progress bars. The full preset downloads ~147 MB of Debian packages. The
+installer verifies Debian's signed `InRelease`, codename, architecture, optional
+`Valid-Until`, and the `Packages.xz` size and SHA256 before resolving or
+downloading packages. Cached indexes are re-verified and expire after 24 hours;
+every `.deb` is then checked against its authenticated package-index SHA256.
 
 ![installer](docs/screenshot.png)
 
@@ -197,8 +200,21 @@ path (letters, digits, `/`, `.`, `_`, `-` only). `glenv` locates its sysroot
 relative to its own binary.
 
 **How do I add extra Debian packages?**
-`tools/fetch-deps.py [--update] package...` pulls them into the sysroot,
-then run `tools/integrate-system.sh` to refresh `ld.so.cache`.
+`tools/fetch-deps.py [--update] package...` pulls them into the sysroot
+after checking signed Debian metadata, dependency versions, and each archive
+before applying the staged files. The helper keeps a transaction history:
+`tools/fetch-deps.py history` lists updates and
+`tools/fetch-deps.py rollback [transaction-id]` restores the latest active
+transaction. Run `tools/integrate-system.sh` after an update to refresh `ld.so.cache`.
+For an externally supplied `.deb`, use
+`tools/fetch-deps.py --deb-file ./package.deb`; it is accepted only when its
+package name, version, architecture, and SHA256 exactly match the current
+authenticated Debian index. `tools/fetch-deps.py upgrade` refreshes the signed
+index and reinstalls the packages in active transaction history.
+Use `tools/fetch-deps.py upgrade --dry-run` to refresh the authenticated index,
+resolve the upgrade dependency set, and print package versions without
+downloading archives or modifying the sysroot. The Veyra frontend exposes
+the same preview as `vpkg upgrade --from glenv --dry-run`.
 
 ## Repository structure
 
@@ -244,7 +260,7 @@ All three run in CI on every push ([.github/workflows/ci.yml](.github/workflows/
 
 GPL-3.0-only — see [LICENSE](LICENSE). The Debian packages downloaded by the
 installer remain under their own licenses; this project only fetches and
-verifies them (SHA256 from the Debian package index over HTTPS).
+verifies them through Debian's signed release metadata and package SHA256 hashes.
 
 **Disclaimer:** this is not an official Alpine or Debian project. It replaces
 the system dynamic loader entry point — read the plan screen, and use

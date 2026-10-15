@@ -95,14 +95,16 @@ chmod 755 "$T/install.sh" "$T/bin/glenv"
 
 # ---- 3. install (line mode: 3=full preset, y=confirm) ---------------------
 log "install: full preset, line mode"
-printf '3\ny\n' | chroot "$ROOTFS" env GLENV_PREFIX="$TEST_PREFIX" sh /root/glenv/install.sh \
+printf '3\ny\ny\n' | chroot "$ROOTFS" env GLENV_PREFIX="$TEST_PREFIX" sh /root/glenv/install.sh \
     > "$LOGDIR/glenv-cleanroom-install.log" 2>&1
 _rc=$?
 INSTALL_LOG="$LOGDIR/glenv-cleanroom-install.log"
 if [ "$_rc" -eq 0 ]; then pass "install exit code 0"; else fail "install exit code $_rc"; fi
 assert "install log says finished"        grep -q "installation finished" "$INSTALL_LOG"
 assert "install log says 9/9 checks"      grep -q "9/9 checks passed" "$INSTALL_LOG"
+assert "Debian signed index verified"       grep -q "InRelease signature, freshness, index hash" "$INSTALL_LOG"
 assert "sha256 verified message"          grep -q "sha256 verified" "$INSTALL_LOG"
+assert "zstd installed for Debian archives" chroot "$ROOTFS" sh -c 'command -v zstd >/dev/null'
 assert "glibc loader installed"           test -s "$ROOTFS/lib/ld-linux-x86-64.so.2"
 assert "/lib64 symlink created"           test -L "$ROOTFS/lib64/ld-linux-x86-64.so.2"
 assert "ld.so.cache non-empty"            test -s "$ROOTFS/etc/ld.so.cache"

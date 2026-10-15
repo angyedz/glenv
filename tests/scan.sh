@@ -37,6 +37,11 @@ if command -v python3 >/dev/null 2>&1; then
                 ;;
         esac
     done
+    if python3 tests/test_fetch_deps.py; then
+        ok "Debian resolver, archive safety, and rollback tests"
+    else
+        no "Debian resolver, archive safety, and rollback tests"
+    fi
 else
     echo "[scan] skip: python3 not available"
 fi
