@@ -2,17 +2,19 @@
 """Debian dependency resolver and package extractor into the glenv sysroot."""
 import datetime
 import email.utils
-import glob
 import hashlib
+import json
 import lzma
 import os
 import re
 import shutil
+import tarfile
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
+from pathlib import PurePosixPath
 
 PREFIX = os.environ.get("GLENV_PREFIX") or ("/opt/glibc-env" if os.path.isdir("/opt/glibc-env/sysroot") else os.path.expanduser("~/glibc-env"))
 DEBS = os.path.join(PREFIX, "debs")
@@ -199,7 +201,7 @@ def _sha256_file(path):
 def parse_packages():
     verify_cached_index()
     index = {}      # name -> pkg dict
-    provides = {}   # virtual -> real names
+    provides = {}   # virtual -> [(real name, provided version)]
     with open(os.path.join(DEBS, "Packages")) as f:
         cur = {}
         for line in f:
@@ -208,77 +210,542 @@ def parse_packages():
                 if cur.get("Package"):
                     index[cur["Package"]] = cur
                     for p in cur.get("Provides", "").split(","):
-                        p = p.strip().split("(")[0].strip()
-                        if p:
-                            provides.setdefault(p, []).append(cur["Package"])
+                        match = re.fullmatch(r"\s*([a-z0-9][a-z0-9+.-]*)(?:\s*\(=\s*([^)]+)\))?\s*", p, re.I)
+                        if match:
+                            provides.setdefault(match.group(1), []).append(
+                                (cur["Package"], match.group(2)))
                 cur = {}
                 continue
             if line.startswith(" "):
+                if cur:
+                    key = next(reversed(cur))
+                    cur[key] += " " + line.strip()
                 continue
             k, _, v = line.partition(":")
             cur[k] = v.strip()
         if cur.get("Package"):
             index[cur["Package"]] = cur
+            for p in cur.get("Provides", "").split(","):
+                match = re.fullmatch(r"\s*([a-z0-9][a-z0-9+.-]*)(?:\s*\(=\s*([^)]+)\))?\s*", p, re.I)
+                if match:
+                    provides.setdefault(match.group(1), []).append(
+                        (cur["Package"], match.group(2)))
     return index, provides
 
-def dep_names(field):
-    """'a (>= 1), b | c, d' -> [['a','b','c'], ['d']]"""
+_DEP_ATOM = re.compile(
+    r"^\s*([a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?)(?:\s*\(\s*(<<|<=|=|>=|>>)\s*([^)]+)\s*\))?\s*$",
+    re.I,
+)
+
+def dep_groups(field):
+    """Parse Debian dependency clauses without discarding version constraints."""
+    if not field.strip():
+        return []
     out = []
-    for grp in field.split(","):
-        alts = [re.sub(r"\(.*?\)", "", a).strip() for a in grp.split("|")]
-        alts = [a for a in alts if a]
-        if alts:
-            out.append(alts)
+    for group in field.split(","):
+        if not group.strip():
+            continue
+        alternatives = []
+        for raw in group.split("|"):
+            match = _DEP_ATOM.fullmatch(raw)
+            if not match:
+                raise RuntimeError("unsupported Debian dependency syntax: " + raw.strip())
+            name = match.group(1).split(":", 1)[0]
+            alternatives.append((name, match.group(2), match.group(3)))
+        if alternatives:
+            out.append(alternatives)
     return out
 
+def _version_part_cmp(left, right):
+    """Compare Debian upstream/revision parts using dpkg's verrevcmp ordering."""
+    i = j = 0
+    while i < len(left) or j < len(right):
+        while (i < len(left) and not left[i].isdigit()) or (j < len(right) and not right[j].isdigit()):
+            a = left[i] if i < len(left) and not left[i].isdigit() else ""
+            b = right[j] if j < len(right) and not right[j].isdigit() else ""
+            def order(char):
+                if char == "~":
+                    return -1
+                if not char:
+                    return 0
+                return ord(char) if char.isalpha() else ord(char) + 256
+            if order(a) != order(b):
+                return -1 if order(a) < order(b) else 1
+            if a:
+                i += 1
+            if b:
+                j += 1
+        while i < len(left) and left[i] == "0":
+            i += 1
+        while j < len(right) and right[j] == "0":
+            j += 1
+        ai, bj = i, j
+        while i < len(left) and left[i].isdigit():
+            i += 1
+        while j < len(right) and right[j].isdigit():
+            j += 1
+        a, b = left[ai:i], right[bj:j]
+        if len(a) != len(b):
+            return -1 if len(a) < len(b) else 1
+        if a != b:
+            return -1 if a < b else 1
+    return 0
+
+def deb_version_cmp(left, right):
+    def split(version):
+        epoch, separator, rest = version.partition(":")
+        if not separator:
+            epoch, rest = "0", version
+        if not epoch.isdigit():
+            raise RuntimeError("invalid Debian version epoch: " + version)
+        upstream, separator, revision = rest.rpartition("-")
+        if not separator:
+            upstream, revision = rest, "0"
+        return int(epoch), upstream, revision
+    left_epoch, left_upstream, left_revision = split(left)
+    right_epoch, right_upstream, right_revision = split(right)
+    if left_epoch != right_epoch:
+        return -1 if left_epoch < right_epoch else 1
+    result = _version_part_cmp(left_upstream, right_upstream)
+    return result if result else _version_part_cmp(left_revision, right_revision)
+
+def satisfies(version, operator, required):
+    if not operator:
+        return True
+    result = deb_version_cmp(version, required)
+    return {"<<": result < 0, "<=": result <= 0, "=": result == 0,
+            ">=": result >= 0, ">>": result > 0}[operator]
+
+def _candidate(name, operator, required, index, provides):
+    direct = index.get(name)
+    if direct and satisfies(direct.get("Version", "0"), operator, required or ""):
+        return direct
+    for provider, provided_version in provides.get(name, []):
+        pkg = index.get(provider)
+        if pkg and (not operator or (provided_version and
+                                     satisfies(provided_version, operator, required))):
+            return pkg
+    return None
+
 def resolve(roots, index, provides):
-    seen, order, missing = set(), [], []
+    selected, order, missing = set(), [], []
     queue = list(roots)
     while queue:
-        name = queue.pop(0)
-        if name in seen:
-            continue
-        seen.add(name)
-        pkg = index.get(name)
+        name, operator, required = queue.pop(0)
+        pkg = _candidate(name, operator, required, index, provides)
         if pkg is None:
-            # virtual package — take the first provider
-            prov = provides.get(name)
-            if prov:
-                for p in prov:
-                    if p not in seen and p in index:
-                        queue.append(p)
-                        break
-                else:
-                    missing.append(name)
-            else:
-                missing.append(name)
+            clause = name + ((" (" + operator + " " + required + ")") if operator else "")
+            missing.append(clause)
             continue
+        pkg_name = pkg["Package"]
+        if pkg_name in selected:
+            continue
+        selected.add(pkg_name)
         order.append(pkg)
-        for grp in dep_names(pkg.get("Depends", "") + ", " + pkg.get("Pre-Depends", "")):
-            for alt in grp:
-                if alt in seen or alt in index or alt in provides:
-                    queue.append(alt)
+        fields = ", ".join(x for x in (pkg.get("Pre-Depends", ""), pkg.get("Depends", "")) if x)
+        for group in dep_groups(fields):
+            choice = None
+            for alt_name, alt_operator, alt_required in group:
+                if _candidate(alt_name, alt_operator, alt_required, index, provides):
+                    choice = (alt_name, alt_operator, alt_required)
                     break
+            if choice:
+                queue.append(choice)
+            else:
+                missing.append(" | ".join(x[0] + ((" (" + x[1] + " " + x[2] + ")") if x[1] else "")
+                                           for x in group))
     return order, missing
 
-def extract(deb_path):
-    tmp = os.path.join(DEBS, ".x")
-    subprocess.run(["rm", "-rf", tmp], check=True)
-    os.makedirs(tmp, exist_ok=True)
-    subprocess.run(["ar", "x", "--output=" + tmp, deb_path], check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    datas = glob.glob(os.path.join(tmp, "data.tar.*"))
-    if not datas:
-        raise RuntimeError("no data.tar in " + deb_path)
-    d = datas[0]
-    r = subprocess.run(["tar", "-xf", d, "-C", SYSROOT])
-    if r.returncode != 0:
-        with open(d, "rb") as fb:
-            subprocess.run(["tar", "-x", "-C", SYSROOT], stdin=fb, check=True)
-    subprocess.run(["rm", "-rf", tmp], check=True)
+def _safe_relative(name):
+    while name.startswith("./"):
+        name = name[2:]
+    if name in ("", "."):
+        return ""
+    path = PurePosixPath(name)
+    if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+        raise RuntimeError("unsafe path in Debian package: " + name)
+    return path.as_posix()
+
+def _safe_extract_tar(archive, destination):
+    seen_links = set()
+    with tarfile.open(archive, "r:*") as tar:
+        for member in tar:
+            name = _safe_relative(member.name)
+            if not name:
+                if member.isdir():
+                    continue
+                raise RuntimeError("empty path in Debian package")
+            parts = PurePosixPath(name).parts
+            for count in range(1, len(parts)):
+                ancestor = "/".join(parts[:count])
+                ancestor_path = os.path.join(destination, *parts[:count])
+                if ancestor in seen_links or os.path.islink(ancestor_path):
+                    raise RuntimeError("package path traverses a symlink: " + name)
+            target = os.path.join(destination, *parts)
+            if member.isdir():
+                if os.path.lexists(target) and (os.path.islink(target) or not os.path.isdir(target)):
+                    raise RuntimeError("package directory conflicts with an existing path: " + name)
+                os.makedirs(target, exist_ok=True)
+            elif member.isfile():
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                if os.path.isdir(target) and not os.path.islink(target):
+                    raise RuntimeError("package file conflicts with a directory: " + name)
+                source = tar.extractfile(member)
+                if source is None:
+                    raise RuntimeError("cannot read package member: " + name)
+                with tempfile.NamedTemporaryFile(prefix=".glenv-", dir=os.path.dirname(target),
+                                                 delete=False) as output:
+                    temp_path = output.name
+                    with source:
+                        shutil.copyfileobj(source, output)
+                os.chmod(temp_path, member.mode & 0o777)
+                os.replace(temp_path, target)
+            elif member.issym():
+                link = member.linkname
+                if not link:
+                    raise RuntimeError("empty symlink in Debian package: " + name)
+                if not os.path.isabs(link):
+                    resolved = os.path.normpath(os.path.join(os.path.dirname(name), link))
+                    if resolved == ".." or resolved.startswith("../"):
+                        raise RuntimeError("symlink escapes sysroot: " + name)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                if os.path.lexists(target):
+                    if os.path.isdir(target) and not os.path.islink(target):
+                        raise RuntimeError("package symlink conflicts with a directory: " + name)
+                    os.unlink(target)
+                fd, temp_path = tempfile.mkstemp(prefix=".glenv-", dir=os.path.dirname(target))
+                os.close(fd)
+                os.unlink(temp_path)
+                os.symlink(link, temp_path)
+                os.replace(temp_path, target)
+                seen_links.add(name)
+            elif member.islnk():
+                source_rel = _safe_relative(member.linkname)
+                source = os.path.join(destination, *PurePosixPath(source_rel).parts)
+                if not os.path.isfile(source) or os.path.islink(source):
+                    raise RuntimeError("invalid hardlink target in Debian package: " + name)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                shutil.copy2(source, target)
+            else:
+                raise RuntimeError("unsupported special file in Debian package: " + name)
+
+def extract(deb_path, destination):
+    members = subprocess.run(["ar", "t", deb_path], check=True, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.splitlines()
+    data_members = [name.strip() for name in members
+                    if re.fullmatch(r"data\.tar(?:\.(?:xz|gz|bz2|lzma|zst))?", name.strip())]
+    if len(data_members) != 1:
+        raise RuntimeError("expected exactly one supported data.tar member in " + deb_path)
+    with tempfile.NamedTemporaryFile(prefix="glenv-data-", dir=os.path.dirname(destination),
+                                     delete=False) as stream:
+        data_path = stream.name
+    try:
+        with open(data_path, "wb") as output:
+            subprocess.run(["ar", "p", deb_path, data_members[0]], check=True, stdout=output,
+                           stderr=subprocess.PIPE)
+        if data_members[0].endswith(".zst"):
+            zstd = shutil.which("zstd")
+            if not zstd:
+                raise RuntimeError("zstd is required to extract this Debian package")
+            with tempfile.NamedTemporaryFile(prefix="glenv-untar-", dir=os.path.dirname(destination),
+                                             delete=False) as stream:
+                tar_path = stream.name
+            try:
+                with open(tar_path, "wb") as output:
+                    subprocess.run([zstd, "-dc", data_path], check=True, stdout=output)
+                _safe_extract_tar(tar_path, destination)
+            finally:
+                os.unlink(tar_path)
+        else:
+            _safe_extract_tar(data_path, destination)
+    finally:
+        os.unlink(data_path)
+
+def _archive_paths(root):
+    dirs, leaves = [], []
+    for current, names, files in os.walk(root, topdown=True, followlinks=False):
+        names[:] = sorted(names)
+        files.sort()
+        for name in list(names):
+            path = os.path.join(current, name)
+            if os.path.islink(path):
+                names.remove(name)
+                leaves.append(path)
+            else:
+                dirs.append(path)
+        leaves.extend(os.path.join(current, name) for name in files)
+    return dirs, leaves
+
+def _state(path):
+    if os.path.islink(path):
+        return {"type": "symlink", "value": os.readlink(path)}
+    if os.path.isfile(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return {"type": "file", "sha256": digest.hexdigest()}
+    if os.path.lexists(path):
+        raise RuntimeError("unsupported non-file package path: " + path)
+    return {"type": "missing"}
+
+def _copy_leaf(source, target):
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".glenv-", dir=os.path.dirname(target))
+    os.close(fd)
+    if os.path.islink(source):
+        os.unlink(temp_path)
+        os.symlink(os.readlink(source), temp_path)
+    else:
+        shutil.copy2(source, temp_path)
+    os.replace(temp_path, target)
+
+def _append_journal(path, event):
+    with open(path, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(event, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+def merge_staged_tree(stage, sysroot, transaction_dir):
+    os.makedirs(sysroot, exist_ok=True)
+    backup_dir = os.path.join(transaction_dir, "backup")
+    os.makedirs(backup_dir)
+    journal_path = os.path.join(transaction_dir, "journal.jsonl")
+    _append_journal(journal_path, {"type": "begin"})
+    dirs, leaves = _archive_paths(stage)
+    dirs.sort(key=lambda path: (path.count(os.sep), path))
+    leaves.sort()
+    created_dirs, changes = [], []
+    for path in dirs:
+        rel = os.path.relpath(path, stage)
+        target = os.path.join(sysroot, rel)
+        if os.path.lexists(target) and (os.path.islink(target) or not os.path.isdir(target)):
+            raise RuntimeError("sysroot directory conflicts with an existing path: " + rel)
+    for path in leaves:
+        rel = os.path.relpath(path, stage)
+        target = os.path.join(sysroot, rel)
+        cursor = os.path.dirname(target)
+        while cursor != sysroot and cursor.startswith(sysroot + os.sep):
+            if os.path.islink(cursor):
+                raise RuntimeError("sysroot path traverses a symlink: " + rel)
+            cursor = os.path.dirname(cursor)
+        if os.path.isdir(target) and not os.path.islink(target):
+            raise RuntimeError("sysroot file conflicts with a directory: " + rel)
+    try:
+        for path in dirs:
+            rel = os.path.relpath(path, stage)
+            target = os.path.join(sysroot, rel)
+            if not os.path.exists(target):
+                rel_posix = rel.replace(os.sep, "/")
+                _append_journal(journal_path, {"type": "directory", "path": rel_posix})
+                os.mkdir(target)
+                created_dirs.append(rel_posix)
+        for number, path in enumerate(leaves):
+            rel = os.path.relpath(path, stage)
+            target = os.path.join(sysroot, rel)
+            before = _state(target)
+            backup_name = str(number)
+            if before["type"] == "symlink":
+                os.symlink(before["value"], os.path.join(backup_dir, backup_name))
+            elif before["type"] == "file":
+                shutil.copy2(target, os.path.join(backup_dir, backup_name))
+            change = {"path": rel.replace(os.sep, "/"), "before": before,
+                      "backup": backup_name if before["type"] != "missing" else None,
+                      "after": _state(path)}
+            _append_journal(journal_path, {"type": "file", "change": change})
+            changes.append(change)
+            _copy_leaf(path, target)
+    except Exception:
+        for change in reversed(changes):
+            target = os.path.join(sysroot, *PurePosixPath(change["path"]).parts)
+            if os.path.lexists(target):
+                if os.path.isdir(target) and not os.path.islink(target):
+                    shutil.rmtree(target)
+                else:
+                    os.unlink(target)
+            before = change["before"]
+            if before["type"] == "symlink":
+                os.symlink(before["value"], target)
+            elif before["type"] == "file":
+                _copy_leaf(os.path.join(backup_dir, change["backup"]), target)
+        for rel in reversed(created_dirs):
+            try:
+                os.rmdir(os.path.join(sysroot, *PurePosixPath(rel).parts))
+            except OSError:
+                pass
+        raise
+    return {"changes": changes, "created_dirs": created_dirs}
+
+def recover_pending_transaction(transaction_dir, sysroot):
+    journal_path = os.path.join(transaction_dir, "journal.jsonl")
+    if not os.path.isfile(journal_path):
+        return
+    with open(journal_path, encoding="utf-8") as stream:
+        events = [json.loads(line) for line in stream if line.strip()]
+    changes = [event["change"] for event in events if event.get("type") == "file"]
+    created_dirs = [event["path"] for event in events if event.get("type") == "directory"]
+    backup_dir = os.path.join(transaction_dir, "backup")
+    for change in reversed(changes):
+        rel = _safe_relative(change["path"])
+        target = os.path.join(sysroot, *PurePosixPath(rel).parts)
+        current = _state(target)
+        if current == change["before"]:
+            continue
+        if current != change["after"]:
+            raise RuntimeError("cannot recover interrupted update; file changed: " + rel)
+        before = change["before"]
+        if os.path.lexists(target):
+            os.unlink(target)
+        if before["type"] == "file":
+            backup = os.path.join(backup_dir, change["backup"])
+            if not os.path.isfile(backup):
+                raise RuntimeError("cannot recover interrupted update; backup missing: " + rel)
+            _copy_leaf(backup, target)
+        elif before["type"] == "symlink":
+            os.symlink(before["value"], target)
+    for rel in reversed(created_dirs):
+        try:
+            os.rmdir(os.path.join(sysroot, *PurePosixPath(rel).parts))
+        except OSError:
+            pass
+
+def recover_pending_transactions():
+    history_root = os.path.join(PREFIX, "history")
+    if not os.path.isdir(history_root):
+        return
+    for name in sorted(os.listdir(history_root)):
+        if not name.startswith(".pending-"):
+            continue
+        path = os.path.join(history_root, name)
+        try:
+            recover_pending_transaction(path, SYSROOT)
+        except Exception as error:
+            raise RuntimeError("interrupted transaction needs recovery at " + path + ": " + str(error))
+        shutil.rmtree(path)
+
+def rollback_entry(entry, transaction_dir=None):
+    if transaction_dir is None:
+        transaction_dir = os.path.join(PREFIX, "history", entry["id"])
+    changes = entry.get("changes", [])
+    for change in changes:
+        rel = _safe_relative(change["path"])
+        target = os.path.join(SYSROOT, *PurePosixPath(rel).parts)
+        cursor = os.path.dirname(target)
+        while cursor != SYSROOT and cursor.startswith(SYSROOT + os.sep):
+            if os.path.islink(cursor):
+                raise RuntimeError("rollback path traverses a sysroot symlink: " + rel)
+            cursor = os.path.dirname(cursor)
+        if _state(target) != change["after"]:
+            raise RuntimeError("rollback refused: sysroot file changed since transaction: " + rel)
+        if change["before"]["type"] != "missing":
+            backup = os.path.join(transaction_dir, "backup", change["backup"])
+            if not os.path.lexists(backup):
+                raise RuntimeError("rollback backup is missing: " + rel)
+    with tempfile.TemporaryDirectory(prefix="glenv-rollback-", dir=PREFIX) as safety:
+        safety_paths = []
+        try:
+            for number, change in enumerate(changes):
+                target = os.path.join(SYSROOT, *PurePosixPath(change["path"]).parts)
+                snapshot = os.path.join(safety, str(number))
+                state = _state(target)
+                if state["type"] == "file":
+                    shutil.copy2(target, snapshot)
+                elif state["type"] == "symlink":
+                    os.symlink(state["value"], snapshot)
+                safety_paths.append((target, snapshot, state))
+                if os.path.lexists(target):
+                    os.unlink(target)
+                before = change["before"]
+                if before["type"] == "file":
+                    _copy_leaf(os.path.join(transaction_dir, "backup", change["backup"]), target)
+                elif before["type"] == "symlink":
+                    fd, temp_path = tempfile.mkstemp(prefix=".glenv-", dir=os.path.dirname(target))
+                    os.close(fd)
+                    os.unlink(temp_path)
+                    os.symlink(before["value"], temp_path)
+                    os.replace(temp_path, target)
+            for rel in reversed(entry.get("created_dirs", [])):
+                try:
+                    os.rmdir(os.path.join(SYSROOT, *PurePosixPath(rel).parts))
+                except OSError:
+                    pass
+        except Exception:
+            for target, snapshot, state in reversed(safety_paths):
+                if os.path.lexists(target):
+                    os.unlink(target)
+                if state["type"] == "file":
+                    _copy_leaf(snapshot, target)
+                elif state["type"] == "symlink":
+                    os.symlink(state["value"], target)
+            raise
+
+def _download_verified(pkg, temp_dir):
+    filename = pkg.get("Filename", "")
+    relative = PurePosixPath(filename)
+    if relative.is_absolute() or not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
+        raise RuntimeError("unsafe Filename in signed Debian index: " + filename)
+    cached = os.path.join(DEBS, os.path.basename(filename))
+    if os.path.isfile(cached):
+        try:
+            verify_sha256(cached, pkg.get("SHA256", ""))
+            return cached
+        except RuntimeError:
+            pass
+    path = os.path.join(temp_dir, os.path.basename(filename))
+    urllib.request.urlretrieve(MIRROR + filename, path)
+    verify_sha256(path, pkg.get("SHA256", ""))
+    return path
+
+def _write_json(path, value):
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=".glenv-json-",
+                                     dir=os.path.dirname(path), delete=False) as stream:
+        temp_path = stream.name
+        json.dump(value, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    os.replace(temp_path, path)
+
+def _history_entries():
+    root = os.path.join(PREFIX, "history")
+    if not os.path.isdir(root):
+        return []
+    entries = []
+    for name in os.listdir(root):
+        path = os.path.join(root, name, "manifest.json")
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as stream:
+            entry = json.load(stream)
+        entry["id"] = name
+        entries.append(entry)
+    return sorted(entries, key=lambda item: item.get("created", ""), reverse=True)
 
 def main():
     args = sys.argv[1:]
+    recover_pending_transactions()
+    if args and args[0] in ("history", "--history"):
+        for entry in _history_entries():
+            state = "rolled back" if entry.get("rolled_back") else "active"
+            print("{}  {}  {}  {}".format(entry["id"], state, entry.get("created", "?"),
+                                          ", ".join(entry.get("packages", []))))
+        return
+    if args and args[0] == "rollback":
+        entries = _history_entries()
+        if len(args) > 2:
+            raise RuntimeError("usage: fetch-deps.py rollback [transaction-id]")
+        requested = args[1] if len(args) == 2 else None
+        latest = next((item for item in entries if not item.get("rolled_back")), None)
+        if requested and (latest is None or requested != latest["id"]):
+            raise RuntimeError("only the latest active transaction can be rolled back")
+        entry = latest
+        if entry is None:
+            raise RuntimeError("no matching active transaction to roll back")
+        if entry.get("rolled_back"):
+            raise RuntimeError("transaction is already rolled back: " + entry["id"])
+        rollback_entry(entry)
+        entry["rolled_back"] = True
+        _write_json(os.path.join(PREFIX, "history", entry["id"], "manifest.json"), entry)
+        print("Rolled back transaction " + entry["id"])
+        return
     if args and args[0] in ("--update", "update"):
         update_index()
         args = args[1:]
@@ -287,36 +754,56 @@ def main():
         print("usage: fetch-deps.py pkg...", file=sys.stderr)
         sys.exit(2)
     index, provides = parse_packages()
-    pkgs, missing = resolve(roots, index, provides)
+    pkgs, missing = resolve([(name, None, None) for name in roots], index, provides)
     if missing:
-        print("WARNING, not found:", ", ".join(sorted(set(missing))))
+        raise RuntimeError("dependency resolution failed; unavailable or incompatible: " +
+                           ", ".join(sorted(set(missing))))
     total = len(pkgs)
     print(f"To download: {total} packages")
-    ok = fail = 0
-    for i, pkg in enumerate(pkgs, 1):
-        fn = pkg["Filename"]
-        local = os.path.join(DEBS, os.path.basename(fn))
-        if not os.path.exists(local):
+    os.makedirs(PREFIX, exist_ok=True)
+    history_dir = os.path.join(PREFIX, "history")
+    os.makedirs(history_dir, exist_ok=True)
+    transaction_dir = tempfile.mkdtemp(prefix=".pending-", dir=history_dir)
+    stage = os.path.join(transaction_dir, "sysroot-stage")
+    os.makedirs(stage)
+    manifest = None
+    identifier = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + os.path.basename(transaction_dir)[-8:]
+    preserve_transaction = False
+    try:
+        with tempfile.TemporaryDirectory(prefix="glenv-download-", dir=PREFIX) as download_dir:
+            downloaded = []
+            for number, pkg in enumerate(pkgs, 1):
+                path = _download_verified(pkg, download_dir)
+                extract(path, stage)
+                downloaded.append((pkg, path))
+                print(f"[{number}/{total}] verified and staged {pkg['Package']}")
+            os.makedirs(DEBS, exist_ok=True)
+            for pkg, path in downloaded:
+                final = os.path.join(DEBS, os.path.basename(pkg["Filename"]))
+                if os.path.dirname(path) != DEBS:
+                    shutil.copy2(path, final + ".glenv-new")
+                    os.replace(final + ".glenv-new", final)
+            changes = merge_staged_tree(stage, SYSROOT, transaction_dir)
+            manifest = dict(changes, id=identifier,
+                            created=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                            packages=[pkg["Package"] for pkg in pkgs], rolled_back=False)
+            shutil.rmtree(stage)
+            _write_json(os.path.join(transaction_dir, "manifest.json"), manifest)
+            final_dir = os.path.join(history_dir, identifier)
+            os.replace(transaction_dir, final_dir)
+            transaction_dir = None
+        print(f"Done: {total} packages installed successfully; transaction {identifier}")
+    except Exception:
+        if transaction_dir and os.path.isdir(transaction_dir):
             try:
-                urllib.request.urlretrieve(MIRROR + fn, local)
-            except Exception as e:
-                print(f"[{i}/{total}] FAIL {pkg['Package']}: {e}")
-                fail += 1
-                continue
-        try:
-            verify_sha256(local, pkg.get("SHA256", ""))
-            extract(local)
-            ok += 1
-        except Exception as e:
-            try:
-                os.unlink(local)
-            except OSError:
-                pass
-            print(f"[{i}/{total}] EXTRACT FAIL {pkg['Package']}: {e}")
-            fail += 1
-        if i % 25 == 0 or i == total:
-            print(f"[{i}/{total}] ok={ok} fail={fail}")
-    print(f"Done: ok={ok} fail={fail}")
+                recover_pending_transaction(transaction_dir, SYSROOT)
+            except Exception as rollback_error:
+                preserve_transaction = True
+                print("CRITICAL: automatic recovery failed; recovery data remains at " +
+                      transaction_dir + ": " + str(rollback_error), file=sys.stderr)
+        if transaction_dir and not preserve_transaction:
+            shutil.rmtree(transaction_dir, ignore_errors=True)
+        raise
 
 if __name__ == "__main__":
     main()

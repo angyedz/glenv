@@ -427,23 +427,111 @@ resolve_index() {  # $PACKAGES + $TMP/groups -> $STATS (P/S/M lines)
     STATS="$TMP/stats"
     awk -v SEL="$TMP/groups" -v DEBARCH="$ARCH" '
     function trim(s) { gsub(/^[ \t\r]+|[ \t\r]+$/, "", s); return s }
-    function stripver(s) { gsub(/\([^)]*\)/, "", s); return trim(s) }
-    function flush(   i, n, a, p) {
+    function stripver(s) { gsub(/\([^)]*\)/, "", s); sub(/:[a-z0-9-]+$/, "", s); return trim(s) }
+    function flush(   i, n, a, p, pver) {
         if (cur == "") return
         if ((arch == DEBARCH || arch == "all") && !(cur in V)) {
             V[cur] = 1
-            F[cur] = file; SZ[cur] = size + 0; ISZ[cur] = isize + 0; DEP[cur] = deps; SH[cur] = shasum
+            F[cur] = file; SZ[cur] = size + 0; ISZ[cur] = isize + 0; DEP[cur] = deps; SH[cur] = shasum; VER[cur] = ver
             n = split(prov, a, ",")
-            for (i = 1; i <= n; i++) { p = stripver(a[i]); if (p != "" && !(p in PF)) PF[p] = cur }
+            for (i = 1; i <= n; i++) {
+                p = trim(a[i]); pver = ""
+                if (match(p, /\([^)]*\)/)) {
+                    pver = substr(p, RSTART + 1, RLENGTH - 2)
+                    gsub(/^[ \t]*=[ \t]*/, "", pver)
+                }
+                p = stripver(p)
+                if (p != "" && !(p in PF)) { PF[p] = cur; PV[p] = pver }
+            }
         }
         cur = ""; file = ""; size = ""; isize = ""; deps = ""; prov = ""; arch = ""; ver = ""; shasum = ""
     }
+    function char_order(c,   i) {
+        if (c == "~") return -1
+        if (c == "") return 0
+        for (i = 1; i <= 127; i++) if (sprintf("%c", i) == c) return i
+        return 255
+    }
+    function verpartcmp(a, b,   i, j, ca, cb, ai, bj, an, bn, oa, ob) {
+        i = 1; j = 1
+        while (i <= length(a) || j <= length(b)) {
+            while ((i <= length(a) && substr(a, i, 1) !~ /^[0-9]$/) ||
+                   (j <= length(b) && substr(b, j, 1) !~ /^[0-9]$/)) {
+                ca = (i <= length(a) && substr(a, i, 1) !~ /^[0-9]$/) ? substr(a, i, 1) : ""
+                cb = (j <= length(b) && substr(b, j, 1) !~ /^[0-9]$/) ? substr(b, j, 1) : ""
+                oa = (ca ~ /^[A-Za-z]$/) ? char_order(ca) : ((ca == "") ? 0 : char_order(ca) + 256)
+                ob = (cb ~ /^[A-Za-z]$/) ? char_order(cb) : ((cb == "") ? 0 : char_order(cb) + 256)
+                if (oa != ob) return (oa < ob) ? -1 : 1
+                if (ca != "") i++
+                if (cb != "") j++
+            }
+            while (substr(a, i, 1) == "0") i++
+            while (substr(b, j, 1) == "0") j++
+            ai = i; bj = j
+            while (substr(a, i, 1) ~ /^[0-9]$/ && i <= length(a)) i++
+            while (substr(b, j, 1) ~ /^[0-9]$/ && j <= length(b)) j++
+            an = i - ai; bn = j - bj
+            if (an != bn) return (an < bn) ? -1 : 1
+            ca = substr(a, ai, an); cb = substr(b, bj, bn)
+            if (ca != cb) return (ca < cb) ? -1 : 1
+        }
+        return 0
+    }
+    function debcmp(a, b,   ae, be, p, q, ar, br, i, d) {
+        p = index(a, ":"); q = index(b, ":")
+        ae = (p ? substr(a, 1, p - 1) : "0"); ar = (p ? substr(a, p + 1) : a)
+        be = (q ? substr(b, 1, q - 1) : "0"); br = (q ? substr(b, q + 1) : b)
+        if (ae + 0 != be + 0) return (ae + 0 < be + 0) ? -1 : 1
+        p = 0; q = 0
+        for (i = length(ar); i > 0; i--) if (substr(ar, i, 1) == "-") { p = i; break }
+        for (i = length(br); i > 0; i--) if (substr(br, i, 1) == "-") { q = i; break }
+        if (p) { ae = substr(ar, 1, p - 1); ar = substr(ar, p + 1) }
+        else { ae = ar; ar = "0" }
+        if (q) { be = substr(br, 1, q - 1); br = substr(br, q + 1) }
+        else { be = br; br = "0" }
+        d = verpartcmp(ae, be)
+        return d ? d : verpartcmp(ar, br)
+    }
+    function dep_ok(atom,   name, virtual, op, req, open, close, body, fields, actual, cmp) {
+        atom = trim(atom); name = atom; op = ""; req = ""
+        open = index(atom, "(")
+        if (open) {
+            close = index(substr(atom, open + 1), ")")
+            if (!close) return 0
+            body = trim(substr(atom, open + 1, close - 1))
+            split(body, fields, /[ \t]+/)
+            op = fields[1]; req = fields[2]
+            if (op !~ /^(<<|<=|=|>=|>>)$/ || req == "") return 0
+            name = trim(substr(atom, 1, open - 1))
+        }
+        sub(/:.*/, "", name)
+        if (name in V) actual = VER[name]
+        else if (name in PF) {
+            virtual = name
+            name = PF[virtual]
+            actual = PV[virtual]
+            if (op != "" && actual == "") return 0
+            if (actual == "") actual = VER[name]
+        } else return 0
+        if (op == "") return 1
+        cmp = debcmp(actual, req)
+        if (op == "<<") return cmp < 0
+        if (op == "<=") return cmp <= 0
+        if (op == "=") return cmp == 0
+        if (op == ">=") return cmp >= 0
+        return cmp > 0
+    }
     FILENAME != SEL {
         if ($0 == "") { flush(); next }
-        if ($0 ~ /^[ \t]/) next
+        if ($0 ~ /^[ \t]/) {
+            if (lastkey == "Depends" || lastkey == "Pre-Depends") deps = deps " " trim($0)
+            else if (lastkey == "Provides") prov = prov " " trim($0)
+            next
+        }
         pos = index($0, ":")
         if (pos == 0) next
         key = substr($0, 1, pos - 1); val = substr($0, pos + 2)
+        lastkey = key
         if (key == "Package") { if (cur != "") flush(); cur = val }
         else if (key == "Version") ver = val
         else if (key == "Filename") file = val
@@ -469,6 +557,8 @@ resolve_index() {  # $PACKAGES + $TMP/groups -> $STATS (P/S/M lines)
         for (gi = 1; gi <= gcnt; gi++) {
             g = GN[gi]
             for (k in Q) delete Q[k]
+            for (k in seen) delete seen[k]
+            for (k in missing) delete missing[k]
             hd = 0; ql = 0
             n = split(GP[g], a, " ")
             for (i = 1; i <= n; i++) if (a[i] != "") qadd(a[i])
@@ -487,16 +577,18 @@ resolve_index() {  # $PACKAGES + $TMP/groups -> $STATS (P/S/M lines)
                 ng = split(d, grps, ",")
                 for (i = 1; i <= ng; i++) {
                     na = split(grps[i], alts, "|")
+                    chosen = 0
                     for (j = 1; j <= na; j++) {
-                        alt = stripver(alts[j])
+                        alt = trim(alts[j])
                         if (alt == "") continue
-                        if ((alt in seen) || (alt in V) || (alt in PF)) { qadd(alt); break }
+                        if (dep_ok(alt)) { alt = stripver(alt); qadd(alt); chosen = 1; break }
                     }
+                    if (!chosen) missing[trim(grps[i])] = 1
                 }
             }
+            for (m in missing) printf "M\t%s\t%s\n", g, m
             printf "S\t%s\t%d\t%d\t%d\n", g, cnt, bytes, disk
         }
-        for (m in missing) printf "M\t%s\n", m
     }
     ' "$PACKAGES" "$TMP/groups" > "$STATS" 2>"$TMP/awk.err"
     [ -s "$STATS" ] || { [ -s "$TMP/awk.err" ] && cat "$TMP/awk.err"; return 1; }
@@ -514,6 +606,24 @@ load_stats() {
             M) MISSING_N=$((MISSING_N + 1)) ;;
         esac
     done < "$STATS"
+}
+
+check_selected_dependencies() {
+    [ -s "${STATS:-}" ] || return 0
+    tab=$(printf '\t')
+    : > "$TMP/selected-missing"
+    while IFS="$tab" read -r _type _group _name _rest; do
+        [ "$_type" = M ] || continue
+        if sel_has "$_group"; then
+            printf '%s: %s\n' "$_group" "$_name" >> "$TMP/selected-missing"
+        fi
+    done < "$STATS"
+    if [ -s "$TMP/selected-missing" ]; then
+        res warn "selected packages have unresolved dependencies:"
+        sed 's/^/          /' "$TMP/selected-missing"
+        return 1
+    fi
+    return 0
 }
 
 build_list() {   # selected groups -> $LIST (name, file, size, kb, sha256)
@@ -660,7 +770,6 @@ plan_screen() {
     pl "Disk required" " $(hkb "$SEL_KB") (+ $(hsize "${DL_TOTAL:-0}") packages cache)"
     pl "Prefix" " $PREFIX ($([ -d "$SYSROOT" ] && printf upgrade || printf fresh))"
     if [ "$FREE_KB" -gt 0 ]; then pl "Free space" " $(hsize "$((FREE_KB * 1024))")"; else pl "Free space" " unknown"; fi
-    [ "${MISSING_N:-0}" -gt 0 ] && printf '        %sUnresolvable dependencies%s     %d (usually virtual packages — harmless)\n' "$C_YEL" "$C_OFF" "$MISSING_N"
     printf '\n        %sSystem changes (need root):%s\n' "$C_DIM" "$C_OFF"
     printf '          + %s        real glibc loader (gcompat kept as *.gcompat-shim)\n' "$LOADER_HOST"
     [ -n "$LOADER_ALIAS_HOST" ] && printf '          + %s      symlink (Debian binaries use this PT_INTERP)\n' "$LOADER_ALIAS_HOST"
@@ -1538,7 +1647,6 @@ main() {
     else
         write_groups
     fi
-    [ "${MISSING_N:-0}" -gt 0 ] && inf "$MISSING_N unresolvable dependencies (virtual packages)"
 
     # ---- 2. components
     stage "Components"
@@ -1566,6 +1674,7 @@ main() {
     fi
     sel_stats
     build_list
+    check_selected_dependencies || die "dependency resolution failed for selected packages"
 
     # ---- 3. plan
     stage "Plan"
@@ -1601,6 +1710,7 @@ main() {
         write_groups
         resolve_index || die "dependency resolution failed for authenticated Debian metadata"
         load_stats
+        check_selected_dependencies || die "dependency resolution failed for selected packages"
         sel_stats
         build_list
         stage "Verified plan"

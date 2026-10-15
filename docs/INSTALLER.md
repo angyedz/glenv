@@ -94,16 +94,24 @@ but the prefix is deliberately retained.
 ## Download verification
 
 For every package the resolver extracts `SHA256` from the Debian `Packages`
-index (the same field `apt` checks). A file — freshly downloaded **or already
-cached** — is only accepted when `sha256sum` matches:
+index only after authenticating Debian's signed `InRelease` metadata. A file —
+freshly downloaded **or already cached** — is only accepted when `sha256sum`
+matches:
 
 * cached mismatch → file deleted and re-downloaded;
-* fresh mismatch → `.part` deleted (a corrupt file cannot be resumed) and the
-  download retried once from scratch;
+* fresh mismatch → the corrupt download is rejected and fetched again from
+  scratch;
 * the stage summary reports `sha256 verified` when every package passed.
 
-If `sha256sum` is missing (it normally is not — BusyBox ships it) the
-preflight warns and verification is skipped rather than blocking the install.
+If `sha256sum`, the Debian archive keyring, or `gpgv` is unavailable,
+the installer obtains the required Alpine prerequisites after the first approval.
+If authenticated metadata or checksum verification is still unavailable, the
+installer stops before extracting Debian packages.
+
+`tools/fetch-deps.py history` lists package transactions. Use
+`tools/fetch-deps.py rollback [transaction-id]` to roll back the latest active
+transaction; rollback is refused if a managed file has changed since that
+transaction was applied.
 
 ## Idempotency
 

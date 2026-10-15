@@ -200,8 +200,12 @@ path (letters, digits, `/`, `.`, `_`, `-` only). `glenv` locates its sysroot
 relative to its own binary.
 
 **How do I add extra Debian packages?**
-`tools/fetch-deps.py [--update] package...` pulls them into the sysroot,
-then run `tools/integrate-system.sh` to refresh `ld.so.cache`.
+`tools/fetch-deps.py [--update] package...` pulls them into the sysroot
+after checking signed Debian metadata, dependency versions, and each archive
+before applying the staged files. The helper keeps a transaction history:
+`tools/fetch-deps.py history` lists updates and
+`tools/fetch-deps.py rollback [transaction-id]` restores the latest active
+transaction. Run `tools/integrate-system.sh` after an update to refresh `ld.so.cache`.
 
 ## Repository structure
 
