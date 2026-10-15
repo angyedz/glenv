@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Focused tests for the authenticated Debian package resolver and transactions."""
-import importlib.util
+import contextlib
 import hashlib
+import importlib.util
 import io
 import os
-import tempfile
 import tarfile
+import tempfile
 import unittest
+from unittest.mock import patch
 
 MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "tools", "fetch-deps.py")
 SPEC = importlib.util.spec_from_file_location("glenv_fetch_deps", MODULE_PATH)
@@ -75,6 +77,33 @@ class ResolverTests(unittest.TestCase):
         packages, missing = fetch.resolve([("app", None, None)], index, {})
         self.assertEqual([pkg["Package"] for pkg in packages], ["app"])
         self.assertEqual(missing, ["libfoo (>= 2.0)"])
+
+
+class UpgradePlanTests(unittest.TestCase):
+    def test_upgrade_dry_run_resolves_packages_without_sysroot_mutations(self):
+        index = {
+            "app": {"Package": "app", "Version": "2.0", "Depends": "libfoo (>= 1.0)"},
+            "libfoo": {"Package": "libfoo", "Version": "1.2"},
+        }
+        history = [{"packages": ["app"]}]
+        with tempfile.TemporaryDirectory() as root:
+            prefix = os.path.join(root, "prefix")
+            sysroot = os.path.join(prefix, "sysroot")
+            output = io.StringIO()
+            with patch.object(fetch.sys, "argv", ["fetch-deps.py", "upgrade", "--dry-run"]), \
+                 patch.object(fetch, "recover_pending_transactions"), \
+                 patch.object(fetch, "update_index"), \
+                 patch.object(fetch, "_history_entries", return_value=history), \
+                 patch.object(fetch, "parse_packages", return_value=(index, {})), \
+                 patch.object(fetch, "PREFIX", prefix), \
+                 patch.object(fetch, "SYSROOT", sysroot), \
+                 contextlib.redirect_stdout(output):
+                fetch.main()
+            self.assertIn("Upgrade plan: 2 packages", output.getvalue())
+            self.assertIn("app 2.0", output.getvalue())
+            self.assertIn("libfoo 1.2", output.getvalue())
+            self.assertFalse(os.path.exists(prefix))
+            self.assertFalse(os.path.exists(sysroot))
 
 
 class ExtractionAndRollbackTests(unittest.TestCase):

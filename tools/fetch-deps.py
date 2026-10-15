@@ -914,6 +914,7 @@ def main():
     local_deb = None
     local_pkg = None
     index = provides = None
+    dry_run = False
     if args and args[0] == "--deb-file":
         if len(args) != 2:
             raise RuntimeError("usage: fetch-deps.py --deb-file path.deb")
@@ -923,8 +924,9 @@ def main():
         local_pkg = verify_local_deb(local_deb, index)
         roots = [local_pkg["Package"]]
     elif args and args[0] == "upgrade":
-        if len(args) != 1:
-            raise RuntimeError("usage: fetch-deps.py upgrade")
+        if len(args) > 2 or (len(args) == 2 and args[1] != "--dry-run"):
+            raise RuntimeError("usage: fetch-deps.py upgrade [--dry-run]")
+        dry_run = len(args) == 2
         update_index()
         roots = sorted({name for entry in _history_entries() if not entry.get("rolled_back")
                         for name in entry.get("packages", [])})
@@ -944,6 +946,11 @@ def main():
     if missing:
         raise RuntimeError("dependency resolution failed; unavailable or incompatible: " +
                            ", ".join(sorted(set(missing))))
+    if dry_run:
+        print(f"Upgrade plan: {len(pkgs)} packages")
+        for pkg in pkgs:
+            print("  {} {}".format(pkg["Package"], pkg.get("Version", "version unknown")))
+        return
     total = len(pkgs)
     print(f"To download: {total} packages")
     os.makedirs(PREFIX, exist_ok=True)

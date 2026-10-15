@@ -211,6 +211,10 @@ For an externally supplied `.deb`, use
 package name, version, architecture, and SHA256 exactly match the current
 authenticated Debian index. `tools/fetch-deps.py upgrade` refreshes the signed
 index and reinstalls the packages in active transaction history.
+Use `tools/fetch-deps.py upgrade --dry-run` to refresh the authenticated index,
+resolve the upgrade dependency set, and print package versions without
+downloading archives or modifying the sysroot. The Veyra frontend exposes
+the same preview as `vpkg upgrade --from glenv --dry-run`.
 
 ## Repository structure
 
